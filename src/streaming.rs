@@ -98,17 +98,18 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
 
             // Text content delta
             if let Some(content) = delta["content"].as_str()
-                && !content.is_empty() {
-                    has_content = true;
-                    state.accumulated_text.push_str(content);
-                    events.push(StreamEvent::TextDelta(json!({
-                        "type": "response.output_text.delta",
-                        "item_id": state.msg_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": content
-                    })));
-                }
+                && !content.is_empty()
+            {
+                has_content = true;
+                state.accumulated_text.push_str(content);
+                events.push(StreamEvent::TextDelta(json!({
+                    "type": "response.output_text.delta",
+                    "item_id": state.msg_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": content
+                })));
+            }
 
             // Tool call deltas (arrive incrementally in Chat API streaming)
             if let Some(tool_calls) = delta["tool_calls"].as_array() {
@@ -454,9 +455,10 @@ data: [DONE]
                 .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()));
 
             if let Some(data) = data_line
-                && let Some(events) = process_chunk(&mut state, data) {
-                    final_events.extend(events);
-                }
+                && let Some(events) = process_chunk(&mut state, data)
+            {
+                final_events.extend(events);
+            }
         }
 
         assert_eq!(state.accumulated_text, "Hello");

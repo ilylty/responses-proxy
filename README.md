@@ -59,7 +59,7 @@ models:
   - model: deepseek-v4-pro
     provider:
       base_url: https://api.deepseek.com
-      api_key: sk-xxx                    # or: os.environ/DEEPSEEK_API_KEY
+      api_key: sk-xxx                    
     downstream_model: deepseek-chat      # optional, defaults to model
 
   - model: deepseek-v4-flash
@@ -124,7 +124,7 @@ server:
 The `api_key` field supports LiteLLM-style environment variable references:
 
 ```yaml
-api_key: os.environ/DEEPSEEK_API_KEY   # reads from $DEEPSEEK_API_KEY
+api_key: $DEEPSEEK_API_KEY     # 从环境变量读取
 api_key: sk-plain-text-key             # static key
 ```
 
@@ -177,7 +177,7 @@ models:
   - model: deepseek-v4-pro      # 暴露给 Responses API 客户端的模型名
     provider:
       base_url: https://api.deepseek.com
-      api_key: sk-xxx                # 或使用 os.environ/环境变量名
+      api_key: sk-xxx                # 或使用 $环境变量名
     downstream_model: deepseek-chat  # 可选，默认等于 model
 ```
 
@@ -209,7 +209,7 @@ server:
 `api_key` 支持 LiteLLM 风格的环境变量引用：
 
 ```yaml
-api_key: os.environ/DEEPSEEK_API_KEY   # 从环境变量读取
+api_key: $DEEPSEEK_API_KEY   # 从环境变量读取
 api_key: sk-明文密钥                    # 静态密钥
 ```
 

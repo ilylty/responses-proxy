@@ -12,15 +12,16 @@ pub fn responses_to_chat(
 
     // 1. Handle `instructions` → prepend as system message.
     if let Some(ref instructions) = req.instructions
-        && !instructions.is_empty() {
-            messages.push(ChatMessage {
-                role: "system".into(),
-                content: ChatMessageContent::String(instructions.clone()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
+        && !instructions.is_empty()
+    {
+        messages.push(ChatMessage {
+            role: "system".into(),
+            content: ChatMessageContent::String(instructions.clone()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
 
     // 2. Convert `input` items.
     match req.input {
@@ -100,7 +101,7 @@ pub fn responses_to_chat(
         tools
             .into_iter()
             .filter_map(|t| {
-                if tool_type_allowlist.iter().any(|tt| *tt == t.tool_type) {
+                if tool_type_allowlist.contains(&t.tool_type) {
                     Some(ChatTool {
                         tool_type: "function".into(),
                         function: ChatFunctionDef {

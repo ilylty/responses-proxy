@@ -27,21 +27,12 @@ fn default_tool_allowlist() -> Vec<String> {
     vec!["function".into()]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub keys: Vec<String>,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            keys: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -78,6 +69,7 @@ fn default_timeout() -> u64 {
 }
 
 /// Resolved provider config with API key resolved from env if needed.
+#[derive(Debug)]
 pub struct ResolvedProvider {
     pub base_url: String,
     pub api_key: String,
@@ -85,6 +77,7 @@ pub struct ResolvedProvider {
 }
 
 /// Fully resolved config with model lookup index.
+#[derive(Debug)]
 pub struct ResolvedConfig {
     pub listen_addr: String,
     pub request_timeout_secs: u64,
@@ -111,15 +104,15 @@ pub fn load_config(path: &str) -> Result<ResolvedConfig, String> {
     resolve_config(config)
 }
 
-fn resolve_api_key(raw: &str) -> String {
-    if let Some(env_var) = raw.strip_prefix("os.environ/") {
-        std::env::var(env_var).unwrap_or_else(|_| {
-            tracing::warn!("Environment variable {} not set, using empty key", env_var);
+/// Resolve a config value. If it starts with `$`, reads from the named environment variable.
+fn resolve_env(raw: &str) -> String {
+    if let Some(var) = raw.strip_prefix('$') {
+        return std::env::var(var).unwrap_or_else(|_| {
+            tracing::warn!("Environment variable {} not set, using empty value", var);
             String::new()
-        })
-    } else {
-        raw.to_string()
+        });
     }
+    raw.to_string()
 }
 
 fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
@@ -131,7 +124,8 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
     }
 
     for entry in &config.models {
-        let api_key = resolve_api_key(&entry.provider.api_key);
+        let base_url = resolve_env(&entry.provider.base_url);
+        let api_key = resolve_env(&entry.provider.api_key);
         let downstream_model = entry
             .downstream_model
             .clone()
@@ -140,7 +134,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         models.insert(
             entry.model.clone(),
             ResolvedProvider {
-                base_url: entry.provider.base_url.clone(),
+                base_url,
                 api_key,
                 downstream_model,
             },
@@ -157,4 +151,260 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         models,
         model_names,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<ResolvedConfig, String> {
+        let config: Config = serde_yaml::from_str(yaml).map_err(|e| format!("parse error: {e}"))?;
+        resolve_config(config)
+    }
+
+    #[test]
+    fn test_minimal_config() {
+        let yaml = r#"
+models:
+  - model: deepseek-v4-pro
+    provider:
+      base_url: https://api.deepseek.com
+      api_key: sk-abc
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.listen_addr, "0.0.0.0:3000");
+        assert_eq!(c.request_timeout_secs, 120);
+        assert!(!c.auth_enabled);
+        assert!(c.auth_keys.is_empty());
+        assert_eq!(c.tool_type_allowlist, vec!["function"]);
+        assert_eq!(c.model_names, vec!["deepseek-v4-pro"]);
+        let p = c.models.get("deepseek-v4-pro").unwrap();
+        assert_eq!(p.base_url, "https://api.deepseek.com");
+        assert_eq!(p.api_key, "sk-abc");
+        assert_eq!(p.downstream_model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_full_config() {
+        let yaml = r#"
+server:
+  listen_addr: "127.0.0.1:8080"
+  request_timeout_secs: 60
+  auth:
+    enabled: true
+    keys:
+      - sk-secret-1
+      - sk-secret-2
+  tool_type_allowlist:
+    - function
+    - web_search_preview
+
+models:
+  - model: my-model
+    provider:
+      base_url: https://example.com
+      api_key: sk-xyz
+    downstream_model: their-model
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.listen_addr, "127.0.0.1:8080");
+        assert_eq!(c.request_timeout_secs, 60);
+        assert!(c.auth_enabled);
+        assert_eq!(c.auth_keys, vec!["sk-secret-1", "sk-secret-2"]);
+        assert_eq!(
+            c.tool_type_allowlist,
+            vec!["function", "web_search_preview"]
+        );
+        let p = c.models.get("my-model").unwrap();
+        assert_eq!(p.base_url, "https://example.com");
+        assert_eq!(p.api_key, "sk-xyz");
+        assert_eq!(p.downstream_model, "their-model");
+    }
+
+    #[test]
+    fn test_missing_server_uses_defaults() {
+        let yaml = r#"
+models:
+  - model: m
+    provider:
+      base_url: https://x.com
+      api_key: k
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.listen_addr, "0.0.0.0:3000");
+        assert_eq!(c.request_timeout_secs, 120);
+        assert!(!c.auth_enabled);
+    }
+
+    #[test]
+    fn test_auth_optional_fields_default() {
+        let yaml = r#"
+server:
+  auth: {}
+models:
+  - model: m
+    provider:
+      base_url: https://x.com
+      api_key: k
+"#;
+        let c = parse(yaml).unwrap();
+        assert!(!c.auth_enabled);
+        assert!(c.auth_keys.is_empty());
+    }
+
+    #[test]
+    fn test_tool_allowlist_defaults_to_function() {
+        let yaml = r#"
+models:
+  - model: m
+    provider:
+      base_url: https://x.com
+      api_key: k
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.tool_type_allowlist, vec!["function"]);
+    }
+
+    #[test]
+    fn test_multiple_models_ordering() {
+        let yaml = r#"
+models:
+  - model: b
+    provider:
+      base_url: https://b.com
+      api_key: kb
+  - model: a
+    provider:
+      base_url: https://a.com
+      api_key: ka
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.model_names, vec!["b", "a"]);
+        assert!(c.models.contains_key("b"));
+        assert!(c.models.contains_key("a"));
+        assert_eq!(c.models["b"].base_url, "https://b.com");
+        assert_eq!(c.models["a"].base_url, "https://a.com");
+    }
+
+    #[test]
+    fn test_downstream_model_defaults_to_model() {
+        let yaml = r#"
+models:
+  - model: gpt-4
+    provider:
+      base_url: https://x.com
+      api_key: k
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.models["gpt-4"].downstream_model, "gpt-4");
+    }
+
+    #[test]
+    fn test_env_var_resolved() {
+        unsafe {
+            std::env::set_var("TEST_API_KEY", "sk-from-env");
+            std::env::set_var("TEST_BASE_URL", "https://env.example.com");
+        }
+
+        let yaml = r#"
+models:
+  - model: m
+    provider:
+      base_url: $TEST_BASE_URL
+      api_key: $TEST_API_KEY
+"#;
+        let c = parse(yaml).unwrap();
+        let p = c.models.get("m").unwrap();
+        assert_eq!(p.base_url, "https://env.example.com");
+        assert_eq!(p.api_key, "sk-from-env");
+    }
+
+    #[test]
+    fn test_env_var_unset_uses_empty() {
+        unsafe {
+            std::env::remove_var("MISSING_VAR");
+        }
+
+        let yaml = r#"
+models:
+  - model: m
+    provider:
+      base_url: https://x.com
+      api_key: $MISSING_VAR
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(c.models["m"].api_key, "");
+    }
+
+    #[test]
+    fn test_no_dollar_prefix_uses_raw_value() {
+        let yaml = r#"
+models:
+  - model: m
+    provider:
+      base_url: https://api.example.com/v1
+      api_key: sk-plain-text-key
+"#;
+        let c = parse(yaml).unwrap();
+        let p = c.models.get("m").unwrap();
+        assert_eq!(p.base_url, "https://api.example.com/v1");
+        assert_eq!(p.api_key, "sk-plain-text-key");
+    }
+
+    #[test]
+    fn test_empty_models_is_error() {
+        let yaml = r#"
+models: []
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("No models configured"));
+    }
+
+    #[test]
+    fn test_missing_models_field_is_error() {
+        let yaml = r#"
+server:
+  listen_addr: "0.0.0.0:3000"
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("No models configured"));
+    }
+
+    #[test]
+    fn test_parse_error_on_missing_provider() {
+        let yaml = r#"
+models:
+  - model: m
+"#;
+        // provider is required, so YAML deser should fail
+        let result = parse(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_error_invalid_yaml() {
+        let result = serde_yaml::from_str::<Config>("{{{ bad yaml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_tool_allowlist() {
+        let yaml = r#"
+server:
+  tool_type_allowlist:
+    - function
+    - web_search_preview
+    - image_generation
+models:
+  - model: m
+    provider:
+      base_url: https://x.com
+      api_key: k
+"#;
+        let c = parse(yaml).unwrap();
+        assert_eq!(
+            c.tool_type_allowlist,
+            vec!["function", "web_search_preview", "image_generation"]
+        );
+    }
 }

@@ -111,9 +111,7 @@ async fn list_models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if let Err(e) = check_auth(&state.config, &headers) {
-        return Err(e);
-    }
+    check_auth(&state.config, &headers)?;
     let data: Vec<serde_json::Value> = state
         .config
         .model_names
@@ -140,9 +138,7 @@ async fn handle_responses(
     body: Bytes,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     // Auth check
-    if let Err(e) = check_auth(&state.config, &headers) {
-        return Err(e);
-    }
+    check_auth(&state.config, &headers)?;
 
     let responses_req: ResponsesRequest = serde_json::from_slice(&body).map_err(|e| {
         (
@@ -348,15 +344,15 @@ async fn handle_streaming(
 
                         if let Some(data) = data_line
                             && let Some(events) = streaming::process_chunk(&mut stream_state, data)
-                            {
-                                for event in events {
-                                    let sse_event =
-                                        SseEvent::default().json_data(event.to_sse_json()).unwrap();
-                                    if tx.send(Ok(sse_event)).await.is_err() {
-                                        return; // client disconnected
-                                    }
+                        {
+                            for event in events {
+                                let sse_event =
+                                    SseEvent::default().json_data(event.to_sse_json()).unwrap();
+                                if tx.send(Ok(sse_event)).await.is_err() {
+                                    return; // client disconnected
                                 }
                             }
+                        }
                     }
                 }
                 Err(_) => {
