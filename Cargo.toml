@@ -8,7 +8,7 @@ repository = "https://github.com/CallOrRet/responses-proxy"
 homepage = "https://github.com/CallOrRet/responses-proxy"
 documentation = "https://docs.rs/responses-proxy"
 readme = "README.md"
-keywords = ["openai", "responses-api", "chat-api", "proxy", "deepseek", "codex", "websocket"]
+keywords = ["openai", "responses-api", "proxy", "deepseek", "websocket"]
 categories = ["api-bindings", "web-programming::http-server"]
 authors = ["CallOrRet <CallOrRet@icloud.com>"]
 
