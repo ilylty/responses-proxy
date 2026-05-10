@@ -1,6 +1,7 @@
 mod config;
 mod convert_request;
 mod convert_response;
+mod crypto;
 mod models;
 mod streaming;
 
@@ -8,7 +9,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        State,
+        Path, State,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
@@ -23,15 +24,20 @@ use convert_request::responses_to_chat;
 use convert_response::chat_to_responses;
 use futures::StreamExt;
 use models::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 
 struct AppState {
     http_client: reqwest::Client,
     config: ResolvedConfig,
+    /// Per-connection conversation history keyed by response_id, with creation time.
+    sessions: RwLock<HashMap<String, (std::time::Instant, Vec<serde_json::Value>)>>,
+    /// AES-256 key for compact summary encryption (32 bytes, hex-decoded from config).
+    compact_key: Option<[u8; 32]>,
 }
 
 #[tokio::main]
@@ -49,12 +55,32 @@ async fn main() {
         config_path
     );
 
+    let compact_key = if resolved.compact_encryption_key.is_empty() {
+        None
+    } else {
+        match hex::decode(&resolved.compact_encryption_key) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                Some(key)
+            }
+            _ => {
+                tracing::warn!(
+                    "compact_encryption_key must be 64 hex chars (32 bytes). Encryption disabled."
+                );
+                None
+            }
+        }
+    };
+
     let state = Arc::new(AppState {
         http_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(resolved.request_timeout))
             .build()
             .expect("Failed to build HTTP client"),
         config: resolved,
+        sessions: RwLock::new(HashMap::new()),
+        compact_key,
     });
 
     let cors = CorsLayer::new()
@@ -68,8 +94,35 @@ async fn main() {
         .route("/v1/models", get(list_models))
         .route("/v1/responses", get(handle_ws).post(handle_responses))
         .route("/v1/responses/compact", post(handle_compact))
+        .route("/v1/responses/{response_id}/cancel", post(handle_cancel))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Spawn periodic session cleanup (every 5 minutes, evict entries older than 30 min).
+    let sessions_cleanup = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let cutoff = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1800))
+                .unwrap_or(std::time::Instant::now());
+            let before = sessions_cleanup.sessions.read().await.len();
+            sessions_cleanup
+                .sessions
+                .write()
+                .await
+                .retain(|_id, (ts, _)| *ts > cutoff);
+            let after = sessions_cleanup.sessions.read().await.len();
+            if before != after {
+                tracing::info!(
+                    before,
+                    after,
+                    "Session cleanup: evicted {} entries",
+                    before - after
+                );
+            }
+        }
+    });
 
     tracing::info!("Listening on {}", listen_addr);
 
@@ -95,65 +148,166 @@ async fn handle_compact(
         )
     })?;
 
-    // Build messages from input items + instructions, same as responses_to_chat.
-    let mut messages = Vec::new();
+    // Response output: user messages from the request input only (OpenAI spec).
+    // Extracted first because summarization_history moves compact_req.input.
+    let request_input = compact_req.input;
+    let output_user_msgs: Vec<serde_json::Value> = match &request_input {
+        Some(Input::Array(items)) => items
+            .iter()
+            .filter(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("message")
+                    && item.get("role").and_then(|v| v.as_str()) == Some("user")
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
 
-    if let Some(ref instructions) = compact_req.instructions
-        && !instructions.is_empty()
+    // Summarization context: prefer global sessions by previous_response_id,
+    // fall back to request input.
+    let summarization_history = match &compact_req.previous_response_id {
+        Some(prev_id) => state
+            .sessions
+            .read()
+            .await
+            .get(prev_id)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default(),
+        None => match request_input {
+            Some(Input::Array(items)) => items,
+            _ => Vec::new(),
+        },
+    };
+    tracing::info!(
+        prev_id = ?compact_req.previous_response_id,
+        summary_items = summarization_history.len(),
+        output_user_msgs = output_user_msgs.len(),
+        "Compact: resolving"
+    );
+
+    // Find the last compaction point — only summarize history after it.
+    // Items before the previous compact are context anchors, already summarized.
+    let start_idx = summarization_history
+        .iter()
+        .rposition(|item| item.get("type").and_then(|v| v.as_str()) == Some("compaction"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    // Build the summarization prompt.
+    let mut conversation_text = String::new();
+
+    // If this is a re-compact, include the previous summary before <conversation>.
+    let mut previous_summary = String::new();
+    if start_idx > 0
+        && let Some(prev) = summarization_history.get(start_idx - 1)
+        && let Some(enc) = prev.get("encrypted_content").and_then(|v| v.as_str())
     {
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": instructions
-        }));
+        let prev_text = match state.compact_key {
+            Some(ref key) => crypto::decrypt(key, enc).unwrap_or_else(|| enc.to_string()),
+            None => enc.to_string(),
+        };
+        if !prev_text.is_empty() {
+            previous_summary =
+                format!("<previous_summary>\n{}\n</previous_summary>\n\n", prev_text);
+        }
     }
 
-    // Convert input items to Chat API messages using the same conversion logic.
-    // Reuse responses_to_chat by constructing a temporary ResponsesRequest.
-    let input = compact_req.input.unwrap_or(Input::String(String::new()));
-    let temp_req = ResponsesRequest {
-        model: compact_req.model.clone(),
-        input,
-        instructions: None, // already handled above
-        temperature: None,
-        top_p: None,
-        max_output_tokens: None,
-        tools: None,
-        tool_choice: None,
-        stream: None,
-        stop: None,
-        top_logprobs: None,
-        previous_response_id: compact_req.previous_response_id,
-        store: None,
-        metadata: None,
-        reasoning: None,
-        text: None,
-    };
-    let chat_req = responses_to_chat(temp_req, &state.config.tool_type_allowlist);
+    let mut pending_calls: std::collections::HashMap<String, (String, String)> = HashMap::new();
+    for item in &summarization_history[start_idx..] {
+        let typ = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match typ {
+            "message" => {
+                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if role == "developer" {
+                    continue;
+                }
+                if role == "user"
+                    && item
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().any(|b| {
+                                b.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(|t| t.contains("<environment_context>"))
+                            })
+                        })
+                {
+                    continue;
+                }
+                let content = item
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !content.is_empty() {
+                    conversation_text.push_str(&format!("<{}>\n{}\n</{}>\n", role, content, role));
+                }
+            }
+            "function_call" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let args = item
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}");
+                pending_calls.insert(call_id, (name.to_string(), args.to_string()));
+            }
+            "function_call_output" => {
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let raw_output = item
+                    .get("output")
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else {
+                            serde_json::to_string(&v).unwrap_or_default()
+                        }
+                    })
+                    .unwrap_or_default();
+                // Strip exec_command metadata wrapper — keep only the actual output.
+                let output = if let Some(pos) = raw_output.find("\nOutput:\n") {
+                    raw_output[pos + 10..].trim().to_string()
+                } else {
+                    raw_output
+                };
 
-    // Add summarization instruction.
-    messages.push(serde_json::json!({
-        "role": "system",
-        "content": "Summarize the conversation above. Include all key decisions, code changes, file edits, user requests, and their outcomes. Be detailed and specific — this summary will replace the full conversation history for future context."
-    }));
-    messages.append(
-        &mut chat_req
-            .messages
-            .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or_default())
-            .collect::<Vec<_>>(),
+                if let Some((name, args)) = pending_calls.remove(call_id) {
+                    conversation_text.push_str(&format!(
+                        "<tool_call>\n{name}({args})\n</tool_call>\n<tool_output>\n{output}\n</tool_output>\n"
+                    ));
+                } else {
+                    conversation_text
+                        .push_str(&format!("<tool_output>\n{output}\n</tool_output>\n"));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Any unmatched calls.
+    for (name, args) in pending_calls.values() {
+        conversation_text.push_str(&format!(
+            "<tool_call>\n{name}({args})\n</tool_call>\n<tool_output>\n(no output)\n</tool_output>\n"
+        ));
+    }
+
+    let system_prompt = format!(
+        "Summarize the conversation below, including all key decisions, code changes, file edits, user requests, and their outcomes. Be detailed and specific — this summary will replace the full conversation history for future context.\n\n{previous_summary}<conversation>\n{conversation_text}</conversation>"
     );
-    // Reorder: system prompts first, then conversation
-    let system_msgs: Vec<_> = messages
-        .iter()
-        .filter(|m| m["role"] == "system")
-        .cloned()
-        .collect();
-    let other_msgs: Vec<_> = messages
-        .iter()
-        .filter(|m| m["role"] != "system")
-        .cloned()
-        .collect();
-    let final_messages: Vec<_> = system_msgs.into_iter().chain(other_msgs).collect();
+
+    let final_messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "system", "content": system_prompt}),
+        serde_json::json!({"role": "user", "content": "Please summarize the conversation above."}),
+    ];
 
     // Look up provider
     let provider = state.config.models.get(&compact_req.model).ok_or_else(|| {
@@ -164,11 +318,22 @@ async fn handle_compact(
     })?;
 
     let url = format!("{}/chat/completions", provider.base_url);
+    tracing::info!(
+        messages = final_messages.len(),
+        endpoint = %url,
+        source = "POST /v1/responses/compact",
+        "Forwarding compact request"
+    );
     let downstream_req = serde_json::json!({
         "model": provider.downstream_model,
         "messages": final_messages,
         "max_tokens": 33000,
+        "thinking": {"type": "disabled"},
     });
+    tracing::debug!(
+        "Compact downstream request: {}",
+        serde_json::to_string(&downstream_req).unwrap_or_else(|e| format!("serialize error: {e}"))
+    );
 
     let response = state
         .http_client
@@ -194,6 +359,12 @@ async fn handle_compact(
             Json(serde_json::json!({"error": {"type": "proxy_error", "message": e.to_string()}})),
         )
     })?;
+
+    tracing::debug!(
+        "Compact downstream response: HTTP {}, body={}",
+        status.as_u16(),
+        body_text
+    );
 
     if !status.is_success() {
         return Err((
@@ -240,49 +411,75 @@ async fn handle_compact(
         }
     });
 
-    let compact_id = format!(
-        "compact_{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")
-    );
+    // OpenAI spec: output = all user messages + one compaction item.
+    let encrypted_content = match state.compact_key {
+        Some(ref key) => {
+            crypto::encrypt(key, summary_text).unwrap_or_else(|| summary_text.to_string())
+        }
+        None => summary_text.to_string(),
+    };
+    let compaction = CompactionItem {
+        id: format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+        encrypted_content,
+    };
+
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let mut output: Vec<CompactedOutputItem> = Vec::new();
+    for mut item in output_user_msgs {
+        if let Some(o) = item.as_object_mut() {
+            o.remove("type");
+        }
+        output.push(CompactedOutputItem::Message(item));
+    }
+    output.push(CompactedOutputItem::Compaction(compaction));
     let resp = CompactedResponse {
-        id: compact_id.clone(),
+        id: response_id.clone(),
         object: "response.compaction",
         created_at: chat_resp.created,
-        output: vec![CompactedOutputItem::Compaction(CompactionItem {
-            id: format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-            encrypted_content: summary_text.to_string(),
-        })],
+        output,
         usage,
     };
 
     Ok(Json(resp))
 }
 
+async fn handle_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    tracing::info!(response_id = %response_id, "Cancel request");
+
+    state.sessions.write().await.remove(&response_id);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    Ok(Json(serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": now,
+        "status": "cancelled",
+        "model": "",
+        "output": []
+    })))
+}
+
 async fn handle_ws(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_session(socket, state))
 }
 
-/// Accumulated session state for WebSocket turns.
-struct WsSession {
-    /// Full accumulated input items across turns.
-    history: Vec<serde_json::Value>,
-    /// Last response ID for continuation.
-    last_response_id: Option<String>,
-}
-
 async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
-    tracing::debug!("WebSocket connection established");
+    tracing::info!("WebSocket connection established");
 
-    let mut session = WsSession {
-        history: Vec::new(),
-        last_response_id: None,
-    };
+    let mut history: Vec<serde_json::Value> = Vec::new();
 
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
             WsMessage::Text(t) => t.to_string(),
             WsMessage::Close(_) => {
-                tracing::debug!("WebSocket client sent close frame");
+                tracing::info!("WebSocket client sent close frame");
                 break;
             }
             _ => continue,
@@ -300,21 +497,27 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
 
         let event_type = event["type"].as_str().unwrap_or("");
 
-        tracing::debug!("WS received event: {event_type}");
+        tracing::info!("WS received event: {event_type}");
 
         match event_type {
             "response.create" => {
                 let model = event["model"]
                     .as_str()
-                    .unwrap_or("deepseek-v4-pro")
+                    .unwrap_or(
+                        state
+                            .config
+                            .model_names
+                            .first()
+                            .map(|s| s.as_str())
+                            .unwrap_or("gpt-5.5"),
+                    )
                     .to_string();
                 let generate = event["generate"].as_bool().unwrap_or(true);
-                let previous_id = event["previous_response_id"].as_str();
 
-                // Handle continuation: if previous_response_id matches last turn,
-                // only append new input items to history.
+                // Resolve per-connection history. Codex CLI sends only the
+                // new turn's input, relying on the server to accumulate.
                 let input_items = event.get("input").cloned().unwrap_or_default();
-                let input_array = if input_items.is_array() {
+                let new_items: Vec<serde_json::Value> = if input_items.is_array() {
                     input_items.as_array().cloned().unwrap_or_default()
                 } else if input_items.is_string() {
                     vec![
@@ -324,45 +527,30 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     vec![]
                 };
 
+                let previous_id = event["previous_response_id"].as_str();
                 if let Some(prev_id) = previous_id {
-                    if session.last_response_id.as_deref() == Some(prev_id) {
-                        // Continuation: append new items to history
-                        session.history.extend(input_array);
+                    if let Some((_, existing)) = state.sessions.read().await.get(prev_id) {
+                        history = existing.clone();
+                        tracing::info!(
+                            prev_id = %prev_id,
+                            existing = history.len(),
+                            new = new_items.len(),
+                            "WS: loaded session history, appending new input"
+                        );
                     } else {
-                        // Previous response not in cache — send error
-                        let _ = socket
-                            .send(WsMessage::Text(
-                                serde_json::json!({
-                                    "type": "error",
-                                    "error": {
-                                        "type": "invalid_request_error",
-                                        "code": "previous_response_not_found",
-                                        "message": format!("Previous response with id '{prev_id}' not found."),
-                                        "param": "previous_response_id"
-                                    }
-                                }).to_string().into()
-                            )).await;
-                        continue;
+                        history.clear();
+                        tracing::info!(prev_id = %prev_id, "WS: session not found, starting fresh");
                     }
                 } else {
-                    // New turn: start fresh history
-                    session.history = input_array;
+                    history.clear();
+                    tracing::info!("WS: new conversation");
                 }
+                history.extend(new_items);
 
-                // Build the full ResponsesRequest with accumulated history
-                let full_input = if session.history.is_empty() {
+                let full_input = if history.is_empty() {
                     Input::String(String::new())
                 } else {
-                    Input::Array(
-                        session
-                            .history
-                            .iter()
-                            .map(|item| {
-                                serde_json::from_value(item.clone())
-                                    .unwrap_or(InputItem::Unknown(item.clone()))
-                            })
-                            .collect(),
-                    )
+                    Input::Array(history.clone())
                 };
 
                 let responses_req = ResponsesRequest {
@@ -445,7 +633,6 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                             .into(),
                         ))
                         .await;
-                    session.last_response_id = Some(response_id);
                     continue;
                 }
 
@@ -460,20 +647,25 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                 let ws_text = responses_req.text.clone();
                 let ws_top_logprobs = responses_req.top_logprobs;
 
-                let mut chat_req =
-                    responses_to_chat(responses_req, &state.config.tool_type_allowlist);
+                let mut chat_req = responses_to_chat(
+                    responses_req,
+                    &state.config.tool_type_allowlist,
+                    state.compact_key.as_ref(),
+                );
 
                 // Replace with downstream model name
                 chat_req.model = provider.downstream_model.clone();
                 chat_req.stream = Some(true);
 
-                tracing::debug!(
-                    "WS Chat API request: {} messages, downstream_model={}",
-                    chat_req.messages.len(),
-                    chat_req.model
-                );
-
                 let url = format!("{}/chat/completions", provider.base_url);
+
+                tracing::info!(
+                    source = "GET /v1/responses (WebSocket)",
+                    messages = chat_req.messages.len(),
+                    downstream_model = %chat_req.model,
+                    endpoint = %url,
+                    "WS Chat API request"
+                );
 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -547,15 +739,15 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                 };
 
                 let http_status = stream_resp.status();
-                tracing::debug!(
+                tracing::info!(
                     "WS downstream stream response: HTTP {}",
                     http_status.as_u16()
                 );
 
                 if !http_status.is_success() {
                     let err_body = stream_resp.text().await.unwrap_or_default();
-                    tracing::debug!(
-                        "WS downstream error: HTTP {}, body={:.500}",
+                    tracing::error!(
+                        "WS downstream error: HTTP {}, body={}",
                         http_status.as_u16(),
                         err_body
                     );
@@ -578,40 +770,95 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                 // Already sent response.created + response.in_progress manually.
                 stream_state.has_started = true;
                 let mut seq: u64 = 2; // 0 = created, 1 = in_progress
+                let mut cancelled = false;
 
-                while let Some(chunk_result) = byte_stream.next().await {
-                    if let Ok(bytes) = chunk_result {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(event_end) = buffer.find("\n\n") {
-                            let event_str = buffer[..event_end].trim().to_string();
-                            buffer = buffer[event_end + 2..].to_string();
-                            let data_line = event_str
-                                .lines()
-                                .find(|l| l.starts_with("data:"))
-                                .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()));
+                loop {
+                    tokio::select! {
+                        chunk_result = byte_stream.next() => {
+                            match chunk_result {
+                                Some(Ok(bytes)) => {
+                                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                    while let Some(event_end) = buffer.find("\n\n") {
+                                        let event_str = buffer[..event_end].trim().to_string();
+                                        buffer = buffer[event_end + 2..].to_string();
+                                        let data_line = event_str
+                                            .lines()
+                                            .find(|l| l.starts_with("data:"))
+                                            .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()));
 
-                            if let Some(data) = data_line
-                                && let Some(events) =
-                                    streaming::process_chunk(&mut stream_state, data)
-                            {
-                                for event in events {
-                                    let et = event.event_type();
-                                    let mut json = event.to_sse_json();
-                                    json["sequence_number"] = serde_json::json!(seq);
-                                    seq += 1;
-                                    tracing::debug!("WS event: {et} {}", json);
-                                    if socket
-                                        .send(WsMessage::Text(json.to_string().into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        tracing::debug!("WS send failed, client disconnected");
-                                        return;
+                                        if let Some(data) = data_line
+                                            && let Some(events) =
+                                                streaming::process_chunk(&mut stream_state, data)
+                                        {
+                                            for event in events {
+                                                let et = event.event_type();
+                                                let mut json = event.to_sse_json();
+                                                json["sequence_number"] = serde_json::json!(seq);
+                                                seq += 1;
+                                                if !et.ends_with("delta") {
+                                                    tracing::info!("WS event: {et}");
+                                                    tracing::debug!("WS event: {et} {}", json);
+                                                }
+                                                if socket
+                                                    .send(WsMessage::Text(json.to_string().into()))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    tracing::info!("WS send failed, client disconnected");
+                                                    return;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
+                                Some(Err(_)) => break,
+                                None => break,
+                            }
+                        }
+                        ws_msg = socket.recv() => {
+                            match ws_msg {
+                                Some(Ok(WsMessage::Text(t))) => {
+                                    if t.trim() == r#"{"type":"response.cancel"}"# {
+                                        tracing::info!("WS cancel received during streaming, aborting downstream");
+                                        cancelled = true;
+                                        break;
+                                    }
+                                }
+                                Some(Ok(WsMessage::Close(_))) => {
+                                    tracing::info!("WebSocket client disconnected during streaming");
+                                    return;
+                                }
+                                None => {
+                                    tracing::info!("WebSocket connection closed during streaming");
+                                    return;
+                                }
+                                _ => continue,
                             }
                         }
                     }
+                }
+
+                if cancelled {
+                    let _ = socket
+                        .send(WsMessage::Text(
+                            serde_json::json!({
+                                "type": "response.cancelled",
+                                "response": {
+                                    "id": response_id,
+                                    "object": "response",
+                                    "model": model,
+                                    "status": "cancelled",
+                                    "output": []
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await;
+                    // Drop byte_stream to close the downstream HTTP connection.
+                    drop(byte_stream);
+                    tracing::debug!("WS downstream stream cancelled");
+                    continue;
                 }
 
                 tracing::debug!(
@@ -620,38 +867,52 @@ async fn handle_ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     stream_state.reasoning_content.len(),
                     stream_state.tool_calls.len()
                 );
-                tracing::debug!("WS waiting for next event");
-
-                // Store assistant output in session history for continuation.
-                // Order matters: reasoning → function_calls → message.
+                // Append assistant output to history for next turn.
                 if !stream_state.reasoning_content.is_empty() {
-                    session.history.push(serde_json::json!({
+                    history.push(serde_json::json!({
                         "type": "reasoning",
                         "id": format!("rs_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-                        "summary": [{"type": "summary_text", "text": stream_state.reasoning_content}]
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": stream_state.reasoning_content}]
                     }));
                 }
-                if !stream_state.tool_calls.is_empty() {
-                    for tc in &stream_state.tool_calls {
-                        if !tc.id.is_empty() {
-                            session.history.push(serde_json::json!({
-                                "type": "function_call",
-                                "call_id": tc.id,
-                                "name": tc.name,
-                                "arguments": tc.arguments
-                            }));
-                        }
+                history.push(if stream_state.accumulated_text.is_empty() {
+                    serde_json::json!({"type": "message", "role": "assistant", "content": []})
+                } else {
+                    serde_json::json!({
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "input_text", "text": stream_state.accumulated_text}]
+                    })
+                });
+                for tc in &stream_state.tool_calls {
+                    if !tc.id.is_empty() {
+                        history.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        }));
                     }
                 }
-                if !stream_state.accumulated_text.is_empty() {
-                    session.history.push(serde_json::json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": stream_state.accumulated_text}]
-                    }));
-                }
 
-                session.last_response_id = Some(response_id);
+                // Persist session state for WS reconnection.
+                {
+                    let mut sessions = state.sessions.write().await;
+                    sessions.insert(
+                        response_id.clone(),
+                        (std::time::Instant::now(), history.clone()),
+                    );
+                    tracing::info!(
+                        response_id = %response_id,
+                        history_items = history.len(),
+                        "WS: stored session"
+                    );
+                }
+                tracing::debug!("WS waiting for next event");
+            }
+            "response.cancel" => {
+                tracing::info!("WS cancel request received, clearing session");
+                history.clear();
             }
             "ping" => {
                 let _ = socket
@@ -724,9 +985,9 @@ async fn handle_responses(
     // Auth check
     check_auth(&state.config, &headers)?;
 
-    let body_preview = String::from_utf8_lossy(&body[..body.len().min(200)]);
-    if body_preview.starts_with('{') || body_preview.starts_with('[') {
-        tracing::debug!("Received request: {}", body_preview.trim());
+    let body_str = String::from_utf8_lossy(&body);
+    if body_str.starts_with('{') || body_str.starts_with('[') {
+        tracing::debug!("Received request: {}", body_str.trim());
     } else {
         tracing::debug!("Received request: {} bytes (non-JSON)", body.len());
     }
@@ -745,6 +1006,14 @@ async fn handle_responses(
 
     let original_model = responses_req.model.clone();
 
+    tracing::info!(
+        model = %original_model,
+        previous_response_id = ?responses_req.previous_response_id,
+        stream = responses_req.stream.unwrap_or(false),
+        source = "POST /v1/responses",
+        "HTTP responses request"
+    );
+
     // Look up the model in config to get provider details.
     let provider = state.config.models.get(&original_model).ok_or_else(|| {
         (
@@ -759,16 +1028,23 @@ async fn handle_responses(
     })?;
 
     let is_stream = responses_req.stream.unwrap_or(false);
-    let mut chat_req = responses_to_chat(responses_req, &state.config.tool_type_allowlist);
+    let mut chat_req = responses_to_chat(
+        responses_req,
+        &state.config.tool_type_allowlist,
+        state.compact_key.as_ref(),
+    );
 
     // Override the model name with the downstream model.
     chat_req.model = provider.downstream_model.clone();
 
+    let endpoint = format!("{}/chat/completions", provider.base_url);
     tracing::info!(
         model = %original_model,
         downstream = %provider.downstream_model,
         messages = chat_req.messages.len(),
         stream = is_stream,
+        endpoint = %endpoint,
+        source = "POST /v1/responses",
         "Forwarding request"
     );
 
@@ -837,7 +1113,7 @@ async fn handle_non_streaming(
     })?;
 
     tracing::debug!(
-        "Downstream response: HTTP {}, body={:.500}",
+        "Downstream response: HTTP {}, body={}",
         status.as_u16(),
         body
     );

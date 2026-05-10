@@ -16,7 +16,7 @@ fn s1_simple_text_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["model"], "gpt-5.5");
@@ -85,7 +85,7 @@ fn s2_instructions_and_reasoning_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -133,8 +133,8 @@ fn s2_reasoning_content_response() {
     assert_eq!(output.len(), 2);
     // reasoning item first
     assert_eq!(output[0]["type"], "reasoning");
-    assert_eq!(output[0]["summary"][0]["type"], "summary_text");
-    assert_eq!(output[0]["summary"][0]["text"], "First, we isolate x by...");
+    assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(output[0]["content"][0]["text"], "First, we isolate x by...");
     // message second
     assert_eq!(output[1]["type"], "message");
     assert_eq!(output[1]["content"][0]["text"], "x = 5");
@@ -163,7 +163,7 @@ fn s3_reasoning_effort_all_levels() {
         }))
         .unwrap();
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         let j = serde_json::to_value(&chat).unwrap();
 
         if *expect_think {
@@ -194,7 +194,7 @@ fn s4_thinking_disables_logprobs() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert!(j.get("logprobs").is_none());
@@ -216,7 +216,7 @@ fn s5_tool_conversation_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -361,7 +361,7 @@ fn s8_finish_reason_all() {
             }
             None => {
                 assert!(
-                    j.get("incomplete_details").map_or(true, |v| v.is_null()),
+                    j.get("incomplete_details").is_none_or(|v| v.is_null()),
                     "finish_reason={reason} expected no incomplete_details, got {:?}",
                     j.get("incomplete_details")
                 );
@@ -384,7 +384,7 @@ fn s9_tool_normalization() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let tools = j["tools"].as_array().unwrap();
@@ -406,7 +406,7 @@ fn s10_text_format_to_response_format() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["response_format"]["type"], "json_object");
@@ -420,7 +420,7 @@ fn s10_no_text_no_response_format() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert!(j.get("response_format").is_none());
@@ -442,7 +442,7 @@ fn s11_passthrough_fields() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["temperature"], 0.7);
@@ -660,7 +660,7 @@ fn s16_instructions_merge_with_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -685,7 +685,7 @@ fn s17_developer_to_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["role"], "system");
@@ -700,13 +700,13 @@ fn s18_reasoning_item_in_input() {
         "model": "gpt-5.5",
         "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What's weather?"}]},
-            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "Let me check the API."}]},
+            {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "Let me check the API."}]},
             {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}
         ]
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -733,7 +733,7 @@ fn s19_multiple_content_blocks_joined() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["content"], "Hello\nWorld");
@@ -750,7 +750,7 @@ fn s20_empty_instructions_ignored() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -771,7 +771,7 @@ fn s21_image_file_blocks_dropped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["content"], "Describe:");
@@ -791,7 +791,7 @@ fn s22_unknown_items_skipped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -809,7 +809,7 @@ fn s23_string_input_with_instructions() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -832,7 +832,7 @@ fn s24_function_call_output_array() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["role"], "tool");
@@ -851,7 +851,7 @@ fn s25_stream_true() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["stream"], true);
@@ -873,7 +873,7 @@ fn s26_consecutive_function_calls_merge() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &["function".into()]);
+    let chat = responses_to_chat(req, &["function".into()], None);
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();

@@ -39,11 +39,14 @@ pub struct ResponsesRequest {
 }
 
 /// The `input` field: either a plain string or an array of typed input items.
+///
+/// The Array variant stores raw JSON values and converts to InputItem
+/// lazily so that a single malformed item doesn't fail the entire request.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Input {
     String(String),
-    Array(Vec<InputItem>),
+    Array(Vec<serde_json::Value>),
 }
 
 impl Input {
@@ -53,10 +56,20 @@ impl Input {
             Input::Array(a) => a.is_empty(),
         }
     }
+
+    #[cfg(test)]
+    pub fn from_items(items: Vec<InputItem>) -> Self {
+        Input::Array(
+            items
+                .into_iter()
+                .map(|item| serde_json::to_value(item).expect("InputItem serialize"))
+                .collect(),
+        )
+    }
 }
 
 /// A single item in the `input` array, discriminated by `type`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum InputItem {
     #[serde(rename = "message")]
@@ -67,13 +80,53 @@ pub enum InputItem {
     FunctionCallOutput(FunctionCallOutputItem),
     #[serde(rename = "reasoning")]
     Reasoning(InputReasoning),
-    // Catch-all for other item types we don't explicitly handle
-    #[serde(untagged)]
-    Unknown(serde_json::Value),
+    #[serde(rename = "compaction")]
+    Compaction(CompactionItem),
+    #[serde(rename = "unknown", skip_serializing)]
+    Unknown,
+}
+
+impl<'de> serde::Deserialize<'de> for InputItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        macro_rules! try_variant {
+            ($ty:ident, $value:expr) => {{
+                let v = $value;
+                match serde_json::from_value(v.clone()) {
+                    Ok(item) => InputItem::$ty(item),
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to deserialize {}: {}. raw={}",
+                            stringify!($ty),
+                            e,
+                            v
+                        );
+                        InputItem::Unknown
+                    }
+                }
+            }};
+        }
+
+        let item_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        let item = match item_type {
+            "message" => try_variant!(Message, value),
+            "function_call" => try_variant!(FunctionCall, value),
+            "function_call_output" => try_variant!(FunctionCallOutput, value),
+            "reasoning" => try_variant!(Reasoning, value),
+            "compaction" => try_variant!(Compaction, value),
+            _ => InputItem::Unknown,
+        };
+        Ok(item)
+    }
 }
 
 /// A message input item: `{"type": "message", "role": "...", "content": [...]}`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct InputMessage {
     pub role: MessageRole,
@@ -84,7 +137,7 @@ pub struct InputMessage {
 }
 
 /// Roles allowed in Responses API input messages.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
@@ -94,7 +147,7 @@ pub enum MessageRole {
 }
 
 /// One content block inside a message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 pub enum InputContentBlock {
     #[serde(rename = "input_text")]
@@ -108,7 +161,7 @@ pub enum InputContentBlock {
 }
 
 /// `{"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct FunctionCallItem {
     pub call_id: String,
@@ -121,7 +174,7 @@ pub struct FunctionCallItem {
 }
 
 /// `{"type": "function_call_output", "call_id": "...", "output": "..."}`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct FunctionCallOutputItem {
     pub call_id: String,
@@ -133,20 +186,23 @@ pub struct FunctionCallOutputItem {
 }
 
 /// The `output` field of a function_call_output item: either a string or an array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum FunctionCallOutputValue {
     String(String),
     Array(Vec<serde_json::Value>),
 }
 
-/// A reasoning input item: `{"type": "reasoning", "id": "...", "summary": [...]}`.
-#[derive(Debug, Deserialize)]
+/// A reasoning input item: `{"type": "reasoning", "id": "...", "summary": [...], "content": [...]}`.
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct InputReasoning {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub summary: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub content: Vec<serde_json::Value>,
 }
 
 /// Tool definition in Responses API format (flattened).
@@ -220,14 +276,15 @@ pub struct CompactedResponse {
 #[serde(tag = "type")]
 pub enum CompactedOutputItem {
     #[serde(rename = "message")]
-    Message(OutputMessage),
+    Message(serde_json::Value),
     #[serde(rename = "compaction")]
     Compaction(CompactionItem),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct CompactionItem {
+    #[serde(default)]
     pub id: String,
     pub encrypted_content: String,
 }
@@ -250,6 +307,8 @@ pub enum OutputItem {
 pub struct OutputReasoning {
     pub id: String,
     pub summary: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub content: Vec<serde_json::Value>,
 }
 
 /// A message output item.

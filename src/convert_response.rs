@@ -18,8 +18,9 @@ pub fn chat_to_responses(
         {
             output_items.push(OutputItem::Reasoning(OutputReasoning {
                 id: format!("rs_{}", Uuid::new_v4().to_string().replace('-', "")),
-                summary: vec![serde_json::json!({
-                    "type": "summary_text",
+                summary: vec![],
+                content: vec![serde_json::json!({
+                    "type": "reasoning_text",
                     "text": rc
                 })],
             }));

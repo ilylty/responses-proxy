@@ -7,27 +7,31 @@ use crate::models::*;
 pub fn responses_to_chat(
     req: ResponsesRequest,
     tool_type_allowlist: &[String],
+    compact_key: Option<&[u8; 32]>,
 ) -> ChatCompletionRequest {
     let mut messages = Vec::new();
     let mut pending_reasoning: Option<String> = None;
 
-    // 1. Handle `instructions` → prepend as system message.
+    // 1. Build system message from instructions + pre-first-user message content.
+    let mut system_parts: Vec<String> = Vec::new();
     if let Some(ref instructions) = req.instructions
         && !instructions.is_empty()
     {
-        messages.push(ChatMessage {
-            role: "system".into(),
-            content: ChatMessageContent::String(instructions.clone()),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+        system_parts.push(instructions.clone());
     }
 
-    // 2. Convert `input` items.
     match req.input {
         Input::String(s) => {
+            if !system_parts.is_empty() {
+                messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: ChatMessageContent::String(system_parts.join("\n\n")),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
             messages.push(ChatMessage {
                 role: "user".into(),
                 content: ChatMessageContent::String(s),
@@ -37,9 +41,72 @@ pub fn responses_to_chat(
                 reasoning_content: None,
             });
         }
-        Input::Array(items) => {
-            // Tool messages must immediately follow assistant(tool_calls).
-            // Multiple consecutive function_calls merge into one assistant message.
+        Input::Array(raw_items) => {
+            let items: Vec<InputItem> = raw_items
+                .iter()
+                .map(|v| {
+                    let item: InputItem =
+                        serde_json::from_value(v.clone()).unwrap_or(InputItem::Unknown);
+                    if let InputItem::Unknown = item {
+                        let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("??");
+                        tracing::debug!(unknown_type = %t, "Unknown input item type, skipping");
+                    }
+                    item
+                })
+                .collect();
+
+            // Find the first user message. Pre-user system/developer messages
+            // are merged with instructions into the chat system message.
+            // Other pre-user items (compaction, reasoning) are still processed
+            // normally in the main loop.
+            let user_start = items
+                .iter()
+                .position(
+                    |item| matches!(item, InputItem::Message(m) if m.role == MessageRole::User),
+                )
+                .unwrap_or(0);
+
+            let mut skip_indices: Vec<usize> = Vec::new();
+            for (i, item) in items.iter().enumerate().take(user_start) {
+                match item {
+                    InputItem::Message(m)
+                        if (m.role == MessageRole::System || m.role == MessageRole::Developer) =>
+                    {
+                        let text = extract_text_from_content(&m.content);
+                        if !text.is_empty() {
+                            system_parts.push(text);
+                        }
+                        skip_indices.push(i);
+                    }
+                    InputItem::Compaction(c) => {
+                        let text = match compact_key {
+                            Some(key) => crate::crypto::decrypt(key, &c.encrypted_content)
+                                .unwrap_or_else(|| c.encrypted_content.clone()),
+                            None => c.encrypted_content.clone(),
+                        };
+                        if !text.is_empty() {
+                            system_parts.push(text);
+                        }
+                        skip_indices.push(i);
+                    }
+                    _ => {}
+                }
+            }
+
+            if !system_parts.is_empty() {
+                messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: ChatMessageContent::String(system_parts.join("\n\n")),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+
+            // Process conversation body. System/developer messages that were
+            // merged into the chat system message are skipped.
+            let skip_set: std::collections::HashSet<usize> = skip_indices.into_iter().collect();
             let mut deferred_tool_msgs: Vec<ChatMessage> = Vec::new();
             let mut pending_tool_calls: Vec<ChatToolCall> = Vec::new();
 
@@ -55,12 +122,19 @@ pub fn responses_to_chat(
                             name: None,
                             tool_calls: Some(std::mem::take(pending)),
                             tool_call_id: None,
-                            reasoning_content: reasoning.take(),
+                            // Clone reasoning so both the text message and the
+                            // tool_calls message carry it. DeepSeek requires
+                            // reasoning_content on all assistant messages in
+                            // thinking mode.
+                            reasoning_content: reasoning.clone(),
                         });
                     }
                 };
 
-            for item in items {
+            for (i, item) in items.into_iter().enumerate() {
+                if skip_set.contains(&i) {
+                    continue;
+                }
                 match item {
                     InputItem::FunctionCallOutput(fco) => {
                         let content_str = match fco.output {
@@ -87,7 +161,7 @@ pub fn responses_to_chat(
                         );
                         messages.append(&mut deferred_tool_msgs);
 
-                        let text = extract_reasoning_summary(&r.summary);
+                        let text = extract_reasoning_summary(&r);
                         if !text.is_empty() {
                             pending_reasoning = Some(match pending_reasoning.take() {
                                 Some(existing) => format!("{}\n{}", existing, text),
@@ -95,7 +169,35 @@ pub fn responses_to_chat(
                             });
                         }
                     }
-                    InputItem::Unknown(_) => {}
+                    InputItem::Unknown => {
+                        tracing::debug!("Unknown input item type, skipping");
+                    }
+                    InputItem::Compaction(c) => {
+                        let text = match compact_key {
+                            Some(key) => crate::crypto::decrypt(key, &c.encrypted_content)
+                                .unwrap_or_else(|| c.encrypted_content.clone()),
+                            None => c.encrypted_content.clone(),
+                        };
+                        tracing::info!(
+                            compaction_id = %c.id,
+                            content_len = text.len(),
+                            "Compaction item recognized, converting to system message"
+                        );
+                        flush_tool_calls(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_reasoning,
+                        );
+                        messages.append(&mut deferred_tool_msgs);
+                        messages.push(ChatMessage {
+                            role: "system".into(),
+                            content: ChatMessageContent::String(text),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        });
+                    }
                     InputItem::FunctionCall(fc) => {
                         pending_tool_calls.push(ChatToolCall {
                             id: fc.call_id.clone(),
@@ -118,25 +220,14 @@ pub fn responses_to_chat(
                         }
 
                         let reasoning = if msg.role == MessageRole::Assistant {
-                            pending_reasoning.take()
+                            pending_reasoning.clone()
                         } else {
+                            // New turn — discard pending reasoning from previous turn.
+                            pending_reasoning.take();
                             None
                         };
                         if let Some(chat_msg) = convert_input_message(&msg, reasoning) {
-                            if (msg.role == MessageRole::System
-                                || msg.role == MessageRole::Developer)
-                                && messages.first().is_some_and(|m| m.role == "system")
-                            {
-                                let text = extract_text_from_content(&msg.content);
-                                if let ChatMessageContent::String(ref mut existing) =
-                                    messages[0].content
-                                {
-                                    existing.push_str("\n\n");
-                                    existing.push_str(&text);
-                                }
-                            } else {
-                                messages.push(chat_msg);
-                            }
+                            messages.push(chat_msg);
                         }
                     }
                 }
@@ -287,9 +378,10 @@ fn convert_input_message(
     })
 }
 
-/// Extract summary text from reasoning summary blocks.
-fn extract_reasoning_summary(summary: &[serde_json::Value]) -> String {
-    let parts: Vec<&str> = summary
+/// Extract reasoning text from summary or content blocks.
+fn extract_reasoning_summary(r: &InputReasoning) -> String {
+    let from_summary: Vec<&str> = r
+        .summary
         .iter()
         .filter_map(|v| {
             v.get("type")
@@ -299,7 +391,22 @@ fn extract_reasoning_summary(summary: &[serde_json::Value]) -> String {
                 .and_then(|t| t.as_str())
         })
         .collect();
-    parts.join("\n")
+    let from_content: Vec<&str> = r
+        .content
+        .iter()
+        .filter_map(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .filter(|t| *t == "reasoning_text")
+                .and_then(|_| v.get("text"))
+                .and_then(|t| t.as_str())
+        })
+        .collect();
+    if !from_content.is_empty() {
+        from_content.join("\n")
+    } else {
+        from_summary.join("\n")
+    }
 }
 
 /// Extract text from input content blocks (join all `input_text` blocks).
@@ -358,7 +465,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[0].content.as_str().unwrap(), "Hello world");
@@ -386,7 +493,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(
@@ -400,7 +507,7 @@ mod tests {
     fn test_array_input_with_user_message() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::Message(InputMessage {
+            input: Input::from_items(vec![InputItem::Message(InputMessage {
                 role: MessageRole::User,
                 content: make_text_content("Hello"),
                 status: None,
@@ -421,7 +528,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[0].content.as_str().unwrap(), "Hello");
@@ -431,7 +538,7 @@ mod tests {
     fn test_array_input_with_system_and_user() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::System,
                     content: make_text_content("You are a bot."),
@@ -459,7 +566,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(chat.messages[1].role, "user");
@@ -469,7 +576,7 @@ mod tests {
     fn test_instructions_merged_with_system_message() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::System,
                     content: make_text_content("System instruction from input."),
@@ -497,7 +604,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, "system");
         let content = chat.messages[0].content.as_str().unwrap();
@@ -511,7 +618,7 @@ mod tests {
     fn test_function_call_item_to_assistant_message() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::FunctionCall(FunctionCallItem {
+            input: Input::from_items(vec![InputItem::FunctionCall(FunctionCallItem {
                 call_id: "call_abc".into(),
                 name: "get_weather".into(),
                 arguments: r#"{"city":"NYC"}"#.into(),
@@ -534,7 +641,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "assistant");
         let tool_calls = chat.messages[0].tool_calls.as_ref().unwrap();
@@ -548,7 +655,7 @@ mod tests {
     fn test_function_call_output_to_tool_message() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::FunctionCallOutput(
+            input: Input::from_items(vec![InputItem::FunctionCallOutput(
                 FunctionCallOutputItem {
                     call_id: "call_abc".into(),
                     output: FunctionCallOutputValue::String("72°F and sunny".into()),
@@ -572,7 +679,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "tool");
         assert_eq!(chat.messages[0].content.as_str().unwrap(), "72°F and sunny");
@@ -586,7 +693,7 @@ mod tests {
     fn test_full_tool_conversation_roundtrip() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::User,
                     content: make_text_content("What's the weather in NYC?"),
@@ -627,7 +734,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 4);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[1].role, "assistant");
@@ -667,7 +774,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         let tools = chat.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool_type, "function");
@@ -715,7 +822,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         let tools = chat.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "func1");
@@ -742,7 +849,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.temperature, Some(0.7));
         assert_eq!(chat.top_p, Some(0.9));
         assert_eq!(chat.max_tokens, Some(2048));
@@ -769,7 +876,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert!(chat.stop.is_some());
     }
 
@@ -794,7 +901,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.stream, Some(true));
     }
 
@@ -802,7 +909,7 @@ mod tests {
     fn test_developer_role_maps_to_system() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::Developer,
                     content: make_text_content("Dev instructions"),
@@ -830,7 +937,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages[0].role, "system");
         assert_eq!(
             chat.messages[0].content.as_str().unwrap(),
@@ -842,7 +949,7 @@ mod tests {
     fn test_multiple_content_blocks_joined() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::Message(InputMessage {
+            input: Input::from_items(vec![InputItem::Message(InputMessage {
                 role: MessageRole::User,
                 content: vec![
                     InputContentBlock::Text {
@@ -870,7 +977,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages[0].content.as_str().unwrap(), "Hello\nWorld");
     }
 
@@ -878,7 +985,7 @@ mod tests {
     fn test_empty_input_array() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![]),
+            input: Input::from_items(vec![]),
             instructions: None,
             temperature: None,
             top_p: None,
@@ -895,7 +1002,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 0);
     }
 
@@ -920,7 +1027,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.tool_choice.unwrap(), serde_json::json!("required"));
     }
 
@@ -928,7 +1035,7 @@ mod tests {
     fn test_function_call_output_array_extracts_text() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::FunctionCallOutput(
+            input: Input::from_items(vec![InputItem::FunctionCallOutput(
                 FunctionCallOutputItem {
                     call_id: "call_1".into(),
                     output: FunctionCallOutputValue::Array(vec![serde_json::json!({
@@ -955,7 +1062,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages[0].role, "tool");
         assert_eq!(
             chat.messages[0].content.as_str().unwrap(),
@@ -968,7 +1075,7 @@ mod tests {
         // image and file blocks should be silently ignored, only text extracted
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::Message(InputMessage {
+            input: Input::from_items(vec![InputItem::Message(InputMessage {
                 role: MessageRole::User,
                 content: vec![
                     InputContentBlock::Text {
@@ -1001,7 +1108,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         // Should only have the text content, image/file silently dropped
         assert_eq!(
             chat.messages[0].content.as_str().unwrap(),
@@ -1010,24 +1117,20 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_input_item_ignored() {
-        // Unknown item types should be silently skipped
+    fn test_compaction_item_merged_into_system() {
+        // Compaction before first user → merged into system message.
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
-                InputItem::Unknown(serde_json::json!({
-                    "type": "item_reference",
-                    "id": "item_abc"
-                })),
+            input: Input::from_items(vec![
+                InputItem::Compaction(CompactionItem {
+                    id: "comp_test".into(),
+                    encrypted_content: "Summary of conversation".into(),
+                }),
                 InputItem::Message(InputMessage {
                     role: MessageRole::User,
                     content: make_text_content("Hello"),
                     status: None,
                 }),
-                InputItem::Unknown(serde_json::json!({
-                    "type": "reasoning_item",
-                    "content": "let me think..."
-                })),
             ]),
             instructions: None,
             temperature: None,
@@ -1045,18 +1148,22 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
-        // Only the user message should survive; unknowns skipped
-        assert_eq!(chat.messages.len(), 1);
-        assert_eq!(chat.messages[0].role, "user");
-        assert_eq!(chat.messages[0].content.as_str().unwrap(), "Hello");
+        let chat = responses_to_chat(req, &["function".into()], None);
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[0].role, "system");
+        assert_eq!(
+            chat.messages[0].content.as_str().unwrap(),
+            "Summary of conversation"
+        );
+        assert_eq!(chat.messages[1].role, "user");
+        assert_eq!(chat.messages[1].content.as_str().unwrap(), "Hello");
     }
 
     #[test]
     fn test_unknown_content_block_ignored() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![InputItem::Message(InputMessage {
+            input: Input::from_items(vec![InputItem::Message(InputMessage {
                 role: MessageRole::User,
                 content: vec![
                     InputContentBlock::Text {
@@ -1088,7 +1195,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages[0].content.as_str().unwrap(), "Hello\nWorld");
     }
 
@@ -1113,7 +1220,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert!(chat.stop.is_some());
     }
 
@@ -1138,7 +1245,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.top_logprobs, Some(5));
     }
 
@@ -1163,7 +1270,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         // Empty instructions should not produce a system message
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
@@ -1190,7 +1297,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.thinking.as_ref().unwrap().thinking_type, "enabled");
         assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
     }
@@ -1216,7 +1323,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.reasoning_effort.as_deref(), Some("max"));
     }
 
@@ -1241,7 +1348,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -1266,7 +1373,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert!(chat.thinking.is_none());
     }
 
@@ -1291,7 +1398,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert!(
             chat.thinking.is_none(),
             "none effort should disable thinking"
@@ -1319,7 +1426,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -1345,7 +1452,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert!(chat.thinking.is_some(), "thinking should be enabled");
         assert_eq!(
             chat.logprobs, None,
@@ -1362,7 +1469,7 @@ mod tests {
         // instructions + developer role in input should merge (same as system merge)
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::Developer,
                     content: make_text_content("Developer instruction."),
@@ -1390,7 +1497,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, "system");
         let content = chat.messages[0].content.as_str().unwrap();
@@ -1402,7 +1509,7 @@ mod tests {
     fn test_reasoning_attaches_to_function_call() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::User,
                     content: make_text_content("What's the weather?"),
@@ -1414,6 +1521,7 @@ mod tests {
                         "type": "summary_text",
                         "text": "Let me check the weather API."
                     })],
+                    content: vec![],
                 }),
                 InputItem::FunctionCall(FunctionCallItem {
                     call_id: "call_1".into(),
@@ -1439,7 +1547,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         // The function_call becomes an assistant message with reasoning_content
         assert_eq!(chat.messages[1].role, "assistant");
@@ -1453,7 +1561,7 @@ mod tests {
     fn test_reasoning_attaches_to_assistant_message() {
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Message(InputMessage {
                     role: MessageRole::User,
                     content: make_text_content("Hi"),
@@ -1465,6 +1573,7 @@ mod tests {
                         "type": "summary_text",
                         "text": "The user is greeting."
                     })],
+                    content: vec![],
                 }),
                 InputItem::Message(InputMessage {
                     role: MessageRole::Assistant,
@@ -1488,7 +1597,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[1].role, "assistant");
         assert_eq!(
@@ -1502,13 +1611,14 @@ mod tests {
         // reasoning should NOT attach to user/system messages, only to assistant ones
         let req = ResponsesRequest {
             model: "deepseek-v4-pro".into(),
-            input: Input::Array(vec![
+            input: Input::from_items(vec![
                 InputItem::Reasoning(InputReasoning {
                     id: "rs_1".into(),
                     summary: vec![serde_json::json!({
                         "type": "summary_text",
                         "text": "This should not go on user msg."
                     })],
+                    content: vec![],
                 }),
                 InputItem::Message(InputMessage {
                     role: MessageRole::User,
@@ -1532,7 +1642,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, "user");
         assert_eq!(chat.messages[0].reasoning_content, None);
@@ -1559,7 +1669,7 @@ mod tests {
             text: Some(serde_json::json!({"format": {"type": "json_object"}})),
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(
             chat.response_format,
             Some(serde_json::json!({"type": "json_object"}))
@@ -1587,7 +1697,7 @@ mod tests {
             text: None,
         };
 
-        let chat = responses_to_chat(req, &["function".into()]);
+        let chat = responses_to_chat(req, &["function".into()], None);
         assert_eq!(chat.response_format, None);
     }
 }

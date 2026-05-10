@@ -483,7 +483,71 @@ fn build_completion_events(state: &StreamState) -> Vec<StreamEvent> {
                 "annotations": []
             }]
         }));
-    } else if !state.accumulated_text.is_empty() || state.tool_calls.is_empty() {
+    } else if state.tool_calls.is_empty() {
+        // Reasoning-only response with no text — still emit the message item
+        // properly so Codex sees a complete event chain.
+        let output_index = state.msg_output_index
+            + state
+                .tool_calls
+                .iter()
+                .filter(|tc| !tc.id.is_empty())
+                .count();
+        events.push(StreamEvent::OutputItemAdded(json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": state.msg_id,
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }
+        })));
+        events.push(StreamEvent::ContentPartAdded(json!({
+            "type": "response.content_part.added",
+            "item_id": state.msg_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": state.accumulated_text,
+                "annotations": []
+            }
+        })));
+        events.push(StreamEvent::OutputTextDone(json!({
+            "type": "response.output_text.done",
+            "item_id": state.msg_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": state.accumulated_text
+        })));
+        events.push(StreamEvent::ContentPartDone(json!({
+            "type": "response.content_part.done",
+            "item_id": state.msg_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": state.accumulated_text,
+                "annotations": []
+            }
+        })));
+        events.push(StreamEvent::OutputItemDone(json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": state.msg_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": state.accumulated_text,
+                    "annotations": []
+                }]
+            }
+        })));
+
         output_items.push(json!({
             "type": "message",
             "id": state.msg_id,

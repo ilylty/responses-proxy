@@ -4,6 +4,10 @@ server:
   # Default: info
   log_level: info
 
+  # AES-256-GCM key for compact summary encryption (64 hex chars = 32 bytes).
+  # Leave empty to skip encryption (plain text).
+  compact_encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
   listen_addr: "0.0.0.0:3000"
   request_timeout: 30
 
@@ -19,6 +23,12 @@ server:
     - function
 
 models:
+  - model: gpt-5.4
+    provider:
+      api_key: $DEEPSEEK_API_KEY
+      base_url: https://api.deepseek.com
+    downstream_model: deepseek-v4-pro
+
   - model: gpt-5.5
     provider:
       api_key: $DEEPSEEK_API_KEY

@@ -23,6 +23,10 @@ pub struct ServerConfig {
     pub tool_type_allowlist: Vec<String>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Hex-encoded 32-byte key for AES-256-GCM compact summary encryption.
+    /// Defaults to empty (no encryption — uses plain text).
+    #[serde(default)]
+    pub compact_encryption_key: String,
 }
 
 fn default_log_level() -> String {
@@ -63,6 +67,7 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             tool_type_allowlist: default_tool_allowlist(),
             log_level: default_log_level(),
+            compact_encryption_key: String::new(),
         }
     }
 }
@@ -95,6 +100,8 @@ pub struct ResolvedConfig {
     pub models: HashMap<String, ResolvedProvider>,
     /// Ordered list of model names for /v1/models
     pub model_names: Vec<String>,
+    /// Hex-encoded AES-256 key for compact summary encryption.
+    pub compact_encryption_key: String,
 }
 
 pub fn load_config(path: &str) -> Result<ResolvedConfig, String> {
@@ -159,6 +166,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig, String> {
         log_level: config.server.log_level,
         models,
         model_names,
+        compact_encryption_key: config.server.compact_encryption_key,
     })
 }
 
