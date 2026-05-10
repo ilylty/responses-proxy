@@ -136,7 +136,7 @@ pub fn process_chunk(state: &mut StreamState, data: &str) -> Option<Vec<StreamEv
     }
 
     // Capture usage from empty-choices chunk (DeepSeek sends this before [DONE])
-    if chunk["choices"].as_array().map_or(false, |c| c.is_empty()) {
+    if chunk["choices"].as_array().is_some_and(|c| c.is_empty()) {
         if let Some(usage) = chunk.get("usage") {
             state.usage = Some(usage.clone());
         }
