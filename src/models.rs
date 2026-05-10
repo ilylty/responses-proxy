@@ -191,6 +191,47 @@ pub struct ResponsesResponse {
     pub error: Option<serde_json::Value>,
 }
 
+// ── Responses API Compact ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactRequest {
+    pub model: String,
+    #[serde(default)]
+    pub input: Option<Input>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactedResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: u64,
+    pub output: Vec<CompactedOutputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum CompactedOutputItem {
+    #[serde(rename = "message")]
+    Message(OutputMessage),
+    #[serde(rename = "compaction")]
+    Compaction(CompactionItem),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactionItem {
+    pub id: String,
+    pub encrypted_content: String,
+}
+
 /// An output item, discriminated by `type`.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]

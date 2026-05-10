@@ -16,7 +16,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event as SseEvent, KeepAlive},
     },
-    routing::get,
+    routing::{get, post},
 };
 use config::ResolvedConfig;
 use convert_request::responses_to_chat;
@@ -67,6 +67,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/v1/models", get(list_models))
         .route("/v1/responses", get(handle_ws).post(handle_responses))
+        .route("/v1/responses/compact", post(handle_compact))
         .layer(cors)
         .with_state(state);
 
@@ -78,6 +79,182 @@ async fn main() {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn handle_compact(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    check_auth(&state.config, &headers)?;
+
+    let compact_req: CompactRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"type": "invalid_request_error", "message": e.to_string()}})),
+        )
+    })?;
+
+    // Build messages from input items + instructions, same as responses_to_chat.
+    let mut messages = Vec::new();
+
+    if let Some(ref instructions) = compact_req.instructions
+        && !instructions.is_empty()
+    {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": instructions
+        }));
+    }
+
+    // Convert input items to Chat API messages using the same conversion logic.
+    // Reuse responses_to_chat by constructing a temporary ResponsesRequest.
+    let input = compact_req.input.unwrap_or(Input::String(String::new()));
+    let temp_req = ResponsesRequest {
+        model: compact_req.model.clone(),
+        input,
+        instructions: None, // already handled above
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        tools: None,
+        tool_choice: None,
+        stream: None,
+        stop: None,
+        top_logprobs: None,
+        previous_response_id: compact_req.previous_response_id,
+        store: None,
+        metadata: None,
+        reasoning: None,
+        text: None,
+    };
+    let chat_req = responses_to_chat(temp_req, &state.config.tool_type_allowlist);
+
+    // Add summarization instruction.
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": "Summarize the conversation above. Include all key decisions, code changes, file edits, user requests, and their outcomes. Be detailed and specific — this summary will replace the full conversation history for future context."
+    }));
+    messages.append(
+        &mut chat_req
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or_default())
+            .collect::<Vec<_>>(),
+    );
+    // Reorder: system prompts first, then conversation
+    let system_msgs: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "system")
+        .cloned()
+        .collect();
+    let other_msgs: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] != "system")
+        .cloned()
+        .collect();
+    let final_messages: Vec<_> = system_msgs.into_iter().chain(other_msgs).collect();
+
+    // Look up provider
+    let provider = state.config.models.get(&compact_req.model).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"type": "invalid_request_error", "message": format!("Unknown model: {}", compact_req.model)}})),
+        )
+    })?;
+
+    let url = format!("{}/chat/completions", provider.base_url);
+    let downstream_req = serde_json::json!({
+        "model": provider.downstream_model,
+        "messages": final_messages,
+    });
+
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .header("Content-Type", "application/json")
+        .json(&downstream_req)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(
+                    serde_json::json!({"error": {"type": "proxy_error", "message": e.to_string()}}),
+                ),
+            )
+        })?;
+
+    let status = response.status();
+    let body_text = response.text().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": {"type": "proxy_error", "message": e.to_string()}})),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": {"type": "downstream_error", "message": body_text}})),
+        ));
+    }
+
+    let chat_resp: ChatCompletionResponse = serde_json::from_str(&body_text).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": {"type": "proxy_error", "message": e.to_string()}})),
+        )
+    })?;
+
+    let summary_text = chat_resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
+        .unwrap_or("");
+
+    let usage = chat_resp.usage.map(|u| {
+        let reasoning_tokens = u
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let cached_tokens = u
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                u.prompt_cache_hit_tokens.unwrap_or(0) as u64
+                    + u.prompt_cache_miss_tokens.unwrap_or(0) as u64
+            }) as u32;
+        ResponseUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            input_tokens_details: InputTokensDetails { cached_tokens },
+            output_tokens_details: OutputTokensDetails { reasoning_tokens },
+        }
+    });
+
+    let compact_id = format!(
+        "compact_{}",
+        uuid::Uuid::new_v4().to_string().replace('-', "")
+    );
+    let resp = CompactedResponse {
+        id: compact_id.clone(),
+        object: "response.compaction",
+        created_at: chat_resp.created,
+        output: vec![CompactedOutputItem::Compaction(CompactionItem {
+            id: format!("comp_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+            encrypted_content: summary_text.to_string(),
+        })],
+        usage,
+    };
+
+    Ok(Json(resp))
 }
 
 async fn handle_ws(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
