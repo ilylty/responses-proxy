@@ -34,21 +34,18 @@ rewrites:
         # Responses API: none -> DeepSeek: disabled
         - if: "^none$"
           with:
-            thinking:
-              type: disabled
+            thinking.type: disabled
         # Rewrite rules are chained in the order written. Handle high/xhigh
         # before broad rules that would change reasoning_effort.
         # DeepSeek reasoning_effort only accepts high / max
         - if: "^(high|xhigh)$"
           set: max
           with:
-            thinking:
-              type: enabled
+            thinking.type: enabled
         - if: "^(minimal|low|medium)$"
           set: high
           with:
-            thinking:
-              type: enabled
+            thinking.type: enabled
       thinking.type:
         - if: "^disabled$"
           with:
