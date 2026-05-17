@@ -14,7 +14,7 @@ models:
       api-key: $DEEPSEEK_API_KEY
       base-url: https://api.deepseek.com
 
-  codex-auth-review:
+  codex-auto-review:
     model: deepseek-v4-flash
     rewrite: deepseek
     provider:
