@@ -1,6 +1,6 @@
 use crate::config::ResolvedConfig;
-use crate::history;
 use crate::prompt;
+use crate::store;
 use std::path::PathBuf;
 
 // ── Filesystem helpers ───────────────────────────────────────────────────
@@ -13,12 +13,12 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
-/// Creates the home directory and its `prompts` / `history` subdirectories.
+/// Creates the home directory and its `prompts` / `store` subdirectories.
 pub fn ensure_dirs() {
     let home = home_dir();
     std::fs::create_dir_all(&home).ok();
     std::fs::create_dir_all(home.join("prompts")).ok();
-    std::fs::create_dir_all(home.join("history")).ok();
+    std::fs::create_dir_all(home.join("store")).ok();
 }
 
 // ── Shared application state ─────────────────────────────────────────────
@@ -28,10 +28,10 @@ pub fn ensure_dirs() {
 pub struct State {
     http_client: reqwest::Client,
     config: ResolvedConfig,
-    history: history::History,
     /// Optional AES-256 key for compact content encryption (32 bytes from hex).
     compact_key: Option<[u8; 32]>,
     prompts: prompt::Prompt,
+    store: store::Store,
 }
 
 impl State {
@@ -55,23 +55,19 @@ impl State {
         };
 
         let prompts = prompt::Prompt::load_from_dir(home.join("prompts"));
-        let history = history::History::new(home.join("history"));
+        let store = store::Store::with_dir(home.clone());
 
         Self {
             http_client: reqwest::Client::new(),
             config,
-            history,
             compact_key,
             prompts,
+            store,
         }
     }
 
     pub fn config(&self) -> &ResolvedConfig {
         &self.config
-    }
-
-    pub fn history(&self) -> &history::History {
-        &self.history
     }
 
     pub fn compact_key(&self) -> Option<&[u8; 32]> {
@@ -84,5 +80,9 @@ impl State {
 
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
+    }
+
+    pub fn store(&self) -> &store::Store {
+        &self.store
     }
 }

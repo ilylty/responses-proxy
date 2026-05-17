@@ -48,7 +48,7 @@ impl ErrorEvent {
             type_: "error".into(),
             status,
             error: Error {
-                code: code.into(),
+                code: Some(code.to_string()),
                 message,
                 r#type: Some(error_type.into()),
                 param: None,
@@ -67,7 +67,7 @@ impl ErrorEvent {
             type_: "error".into(),
             status,
             error: Error {
-                code: code.into(),
+                code: Some(code.to_string()),
                 message,
                 r#type: Some(error_type.into()),
                 param: Some(param.into()),

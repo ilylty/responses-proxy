@@ -1,5 +1,5 @@
 use crate::types::{
-    chat,
+    MessageRole, chat,
     item::*,
     responses::{self, IncompleteReason, ResponseStatus},
 };
@@ -8,6 +8,7 @@ use crate::types::{
 pub fn chat_to_responses(
     chat_resp: chat::Completion,
     original_model: String,
+    compact_key: Option<&[u8; 32]>,
 ) -> responses::Response {
     // Handle error responses from upstream
     if let Some(ref error) = chat_resp.error {
@@ -16,7 +17,7 @@ pub fn chat_to_responses(
             status: ResponseStatus::Failed,
             model: original_model,
             error: Some(responses::Error {
-                code: error.code.clone().unwrap_or_else(|| "server_error".into()),
+                code: error.code.clone(),
                 message: error.message.clone(),
                 r#type: None,
                 param: error.param.clone(),
@@ -32,28 +33,68 @@ pub fn chat_to_responses(
         let mut content_blocks: Vec<OutputContentBlock> = Vec::new();
 
         // Reasoning content → reasoning output item
-        if let Some(ref reasoning) = choice.message.reasoning_content
+        let reasoning_content = choice.message.reasoning_content.as_deref();
+        if let Some(reasoning) = reasoning_content
             && !reasoning.is_empty()
         {
-            output_items.push(OutputItem::Reasoning(Reasoning {
-                id: format!("rs_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-                summary: vec![],
-                encrypted_content: None,
-                content: Some(vec![ReasoningTextPart {
-                    type_: "reasoning_text".into(),
-                    text: reasoning.clone(),
-                }]),
-                status: Some("completed".into()),
-            }));
+            output_items.push(OutputItem::Reasoning(
+                crate::types::streaming::build_reasoning_item(
+                    format!("rs_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+                    reasoning,
+                    compact_key,
+                ),
+            ));
         }
+
+        // Map Chat API logprobs to Responses API format
+        let response_logprobs: Option<Vec<crate::types::item::TextLogprob>> = choice
+            .logprobs
+            .as_ref()
+            .and_then(|lp| lp.content.as_ref())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|t| crate::types::item::TextLogprob {
+                        token: t.token.clone(),
+                        bytes: t.bytes.clone().unwrap_or_default(),
+                        logprob: t.logprob,
+                        top_logprobs: t
+                            .top_logprobs
+                            .iter()
+                            .map(|tl| crate::types::item::TopLogprob {
+                                token: tl.token.clone(),
+                                bytes: tl.bytes.clone().unwrap_or_default(),
+                                logprob: tl.logprob,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            });
+
+        // Map Chat API annotations to Responses format
+        let chat_annotations: Vec<crate::types::item::OutputAnnotation> = choice
+            .message
+            .annotations
+            .as_ref()
+            .map(|anns| {
+                anns.iter()
+                    .map(|a| crate::types::item::OutputAnnotation::UrlCitation {
+                        url: a.url_citation.url.clone(),
+                        title: a.url_citation.title.clone(),
+                        start_index: a.url_citation.start_index,
+                        end_index: a.url_citation.end_index,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Text content or refusal
         if let Some(ref content) = choice.message.content {
             if !content.is_empty() {
                 content_blocks.push(OutputContentBlock::Text {
                     text: content.clone(),
-                    annotations: vec![],
-                    logprobs: None,
+                    annotations: chat_annotations,
+                    logprobs: response_logprobs,
                 });
             }
         } else if choice.finish_reason.as_deref() == Some("content_filter")
@@ -65,9 +106,10 @@ pub fn chat_to_responses(
         }
 
         // Status and incomplete details
-        let item_status = match choice.finish_reason.as_deref() {
+        let normalized_reason = choice.finish_reason.clone();
+        let item_status = match normalized_reason.as_deref() {
             Some("stop") | Some("tool_calls") | Some("length") => "completed",
-            Some("content_filter") | Some("insufficient_system_resource") => "incomplete",
+            Some("content_filter") | Some("server_error") => "incomplete",
             _ => "completed",
         };
 
@@ -124,30 +166,6 @@ pub fn chat_to_responses(
         }
     }
 
-    // Build usage — with DeepSeek-style fallback for cached tokens
-    let usage = chat_resp.usage.map(|u| {
-        let cached_tokens = u
-            .prompt_tokens_details
-            .as_ref()
-            .map(|d| d.cached_tokens)
-            .unwrap_or_else(|| {
-                u.prompt_cache_hit_tokens.unwrap_or(0) + u.prompt_cache_miss_tokens.unwrap_or(0)
-            });
-        responses::Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            input_tokens_details: responses::InputTokensDetails { cached_tokens },
-            output_tokens_details: responses::OutputTokensDetails {
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .map(|d| d.reasoning_tokens)
-                    .unwrap_or(0),
-            },
-        }
-    });
-
     let (final_status, incomplete_details) = if let Some(details) = incomplete_details {
         (ResponseStatus::Incomplete, Some(details))
     } else {
@@ -161,7 +179,74 @@ pub fn chat_to_responses(
         model: original_model,
         output: output_items,
         incomplete_details,
-        usage,
+        usage: chat_resp.usage.map(responses::Usage::from),
         ..Default::default()
     }
+}
+
+impl From<chat::Usage> for responses::Usage {
+    fn from(u: chat::Usage) -> Self {
+        let cached_tokens = u
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning_tokens = u
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        Self {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            input_tokens_details: responses::InputTokensDetails { cached_tokens },
+            output_tokens_details: responses::OutputTokensDetails { reasoning_tokens },
+        }
+    }
+}
+
+/// Convert Responses output items into request input items for continuation.
+///
+/// This is necessarily limited to the item shapes that Chat Completions can
+/// replay: assistant messages, reasoning text, and function/custom tool calls.
+pub fn output_to_input_items(output: &[OutputItem]) -> Vec<InputItem> {
+    let mut items = Vec::new();
+
+    for item in output {
+        match item {
+            OutputItem::Message(msg) => {
+                let content = msg
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        OutputContentBlock::Text { text, .. } => {
+                            InputContentBlock::Text { text: text.clone() }
+                        }
+                        OutputContentBlock::Refusal { refusal } => InputContentBlock::Text {
+                            text: refusal.clone(),
+                        },
+                    })
+                    .collect();
+
+                items.push(InputItem::Message(InputMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                    status: Some(msg.status.clone()),
+                }));
+            }
+            OutputItem::Reasoning(reasoning) => {
+                items.push(InputItem::Reasoning(reasoning.clone()));
+            }
+            OutputItem::FunctionCall(call) => {
+                items.push(InputItem::FunctionCall(call.clone()));
+            }
+            OutputItem::CustomToolCall(call) => {
+                items.push(InputItem::CustomToolCall(call.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    items
 }

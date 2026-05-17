@@ -84,6 +84,15 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
     },
+
+    /// Audio input content block.
+    #[serde(rename = "input_audio")]
+    Audio {
+        /// Base64-encoded audio data.
+        data: String,
+        /// Audio format. Allowed: `"wav"`, `"mp3"`.
+        format: String,
+    },
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

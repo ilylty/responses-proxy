@@ -1,11 +1,12 @@
 # responses-proxy
 
-将 **OpenAI Responses API** 请求转换为 **Chat Completions API** 格式的代理，使任何兼容 Chat API 的服务商（如 DeepSeek）都能服务 Responses API 客户端。支持 HTTP SSE 和 WebSocket 流式传输、推理/思考内容以及工具调用。可作为 **Codex CLI** 的后端直接使用。
+将 **OpenAI Responses API** 请求转换为 **Chat Completions API** 请求，并把 Chat 响应转换回 Responses 格式的代理。代理内部使用的 Responses、Chat Completions 请求体和响应体结构体，都直接参照 OpenAI 官网对应 API 定义建模。支持 HTTP SSE 和 WebSocket 流式传输、推理/思考内容以及工具调用。可作为 **Codex CLI** 的后端直接使用。
 
 ## 特性
 
 - **HTTP SSE & WebSocket** — 同时支持 `POST /v1/responses`（SSE）和 `GET /v1/responses`（WebSocket 升级）
-- **推理 / 思考** — 将 `reasoning.effort` 映射为 DeepSeek 思考模式，流式输出 `reasoning_text.delta` 事件
+- **OpenAI 兼容 typed 边界** — 公开 `/v1/responses` 入口必须先能反序列化成 OpenAI Responses API 请求体；上游/下游 Chat body 使用 OpenAI Chat Completions 请求/响应结构
+- **推理 / 思考** — 将 Responses `reasoning.effort` 映射为 Chat `reasoning_effort`；DeepSeek 等 provider 专用 thinking 字段可通过 `rewrite` 添加
 - **工具调用** — 完整的 `function_call` / `function_call_output` 往返，消息顺序正确
 - **Codex CLI 兼容** — 处理 warmup、`previous_response_id` 续接以及完整的流式事件链
 - **多模型** — 支持按模型配置不同的下游服务商
@@ -63,7 +64,7 @@ server:
 
   # 日志级别: trace, debug, info, warn, error（默认: info）
   # 可通过 RUST_LOG 环境变量覆盖。
-  log_level: info
+  log-level: info
 
   # 鉴权 — 只要 keys 非空即启用鉴权
   auth:
@@ -74,24 +75,111 @@ server:
 
   # CORS 允许来源。空 = 允许任意来源。
   cors:
-    allow_origins: []
+    allow-origins: []
 
-  # 工具类型白名单（默认只允许 function）
-  tool_type_allowlist:
+  # 允许的工具类型（默认只允许 function）
+  allowed-tool-types:
     - function
 
 models:
   gpt-5.5: # 暴露给 Responses API 客户端的模型名
     provider:
-      base_url: https://api.deepseek.com
-      api_key: $DEEPSEEK_API_KEY # 或直接写静态密钥
+      base-url: https://api.deepseek.com
+      api-key: $DEEPSEEK_API_KEY # 或直接写静态密钥
     model: deepseek-v4-pro # 可选，默认等于键名
+    # 可选：按阶段重写 JSON body，用于适配不同上游。
+    # response-in  -> OpenAI 兼容 Responses 请求解析完成后
+    # chat-out     -> 转换后的 Chat 请求发给上游前
+    # chat-in      -> 收到上游 Chat 响应后、转 Responses 前
+    # response-out -> 最终 Responses 响应返回客户端前
+    rewrite:
+      - at: chat-out
+        rename:
+          max_completion_tokens: max_tokens
+      - at: response-out
+        remove:
+          - parallel_tool_calls
 
   codex-auto-review:
     provider:
-      base_url: https://api.deepseek.com
-      api_key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+      api-key: $DEEPSEEK_API_KEY
     model: deepseek-v4-flash
+```
+
+### Rewrite 规则
+
+`rewrite` 可以在每个模型下配置，按代理流程中的四个位置修改 JSON body。公开接口仍然以 OpenAI 兼容 typed body 为边界；rewrite 是 provider 兼容层，会在当前阶段的 body 已经符合对应 OpenAI 结构后再执行。
+
+```text
+client
+  -> Responses typed request
+  -> response-in
+  -> Chat typed request
+  -> chat-out
+  -> upstream provider
+  -> chat-in
+  -> Chat typed response
+  -> Responses typed response
+  -> response-out
+  -> client
+```
+
+每个 stage 内的规则是链式执行，并且按配置书写顺序执行。后面的规则会看到前面规则已经改过的值；同一个 path 上更具体的匹配应该放在更宽泛的匹配前面。
+
+```yaml
+rewrite:
+  - at: response-in
+    reset:
+      max_output_tokens: 2048
+  - at: chat-out
+    rename:
+      max_completion_tokens: max_tokens
+    replace:
+      reasoning_effort:
+        - if: "^(high|xhigh)$"
+          set: max
+          with:
+            thinking:
+              type: enable
+        - if: "^(minimal|low|medium)$"
+          set: high
+          with:
+            provider_options.reasoning:
+              enabled: true
+              budget: 4096
+  - at: chat-in
+    remove:
+      - system_fingerprint
+  - at: response-out
+    replace:
+      service_tier:
+        - if: auto
+          set: priority
+        - if: priority
+          set: default
+```
+
+路径支持字段名、点路径和 JSON Pointer。`reset` 只在目标路径已存在时覆盖，`rename` 移动字段，`remove` 删除字段，`replace` 在当前值匹配 `if` 时把 `set` 写入当前 replace key。字符串形式的 `if` 是 Rust regex 正则表达式；需要精确匹配时用 `^...$`。如果一次匹配还要写其它位置，可以配置 `with`；`with` 是有序的 target path 到 JSON value 的 map。使用 `with` 里的 `""` key 可以指向整个 body。`reset`、`replace.set` 和 `replace.with` 都可以写入任意 JSON 值，包括 map，以及不属于 OpenAI typed struct 的 provider 专用字段，因为 rewrite 在当前阶段完成 OpenAI 兼容 typed 解析/序列化后操作 JSON body。
+
+配置是严格校验的：未知的 proxy 配置字段、未被引用的 rewrite profile、空 rewrite stage、非法的 `if` 正则，以及同一条 replace 里通过 `with` 再次写当前 path，都会在启动解析配置时失败。
+
+可复用规则可以放在顶层 `rewrites` 下，然后在 model 里用名称引用：
+
+```yaml
+models:
+  gpt-5.5:
+    model: deepseek-v4-pro
+    rewrite: deepseek
+    provider:
+      api-key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+
+rewrites:
+  deepseek:
+    at: chat-out
+    rename:
+      max_completion_tokens: max_tokens
 ```
 
 ## 端点
@@ -104,14 +192,14 @@ models:
 
 ## 请求转换
 
-| Responses 字段                                                          | Chat 字段       | 说明                                                                          |
-| ----------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------- |
-| `input`（字符串或数组）                                                 | `messages`      | 字符串→单条 user 消息；数组→转换 message、function_call、function_call_output |
-| `instructions`                                                          | system 消息     | 前置插入，与 input 中已有的 system/developer 消息合并                         |
-| `reasoning`                                                             | `thinking`      | 映射为 DeepSeek 的 `thinking: {type: "enabled"}`                              |
-| `max_output_tokens`                                                     | `max_tokens`    |                                                                               |
-| `tools`（扁平）                                                         | `tools`（嵌套） | 收进 `function` 键下，受 `tool_type_allowlist` 过滤                           |
-| `tool_choice`、`temperature`、`top_p`、`stream`、`stop`、`top_logprobs` | 同              | 透传                                                                          |
+| Responses 字段                                                          | Chat 字段               | 说明                                                                          |
+| ----------------------------------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------- |
+| `input`（字符串或数组）                                                 | `messages`              | 字符串→单条 user 消息；数组→转换 message、function_call、function_call_output |
+| `instructions`                                                          | system 消息             | 前置插入，与 input 中已有的 system/developer 消息合并                         |
+| `reasoning`                                                             | `reasoning_effort`      | DeepSeek `thinking` 等 provider 专用字段可通过 `chat-out` rewrite `replace` 添加 |
+| `max_output_tokens`                                                     | `max_completion_tokens` | 旧上游需要 `max_tokens` 时可用 `chat-out` rewrite `rename` 适配                  |
+| `tools`（扁平）                                                         | `tools`（嵌套）         | 收进 `function` 键下，受 `allowed-tool-types` 过滤                           |
+| `tool_choice`、`temperature`、`top_p`、`stream`、`stop`、`top_logprobs` | 同                      | 透传                                                                          |
 
 ## 响应转换
 
@@ -131,24 +219,24 @@ models:
 
 当 `server.auth.keys` 至少包含一个 key 时，需要鉴权的端点必须携带 `Authorization: Bearer <key>` 请求头，且 key 必须在配置的 keys 列表中。`/health` 始终免鉴权。
 
-## 工具类型白名单
+## 允许的工具类型
 
-`server.tool_type_allowlist` 控制哪些工具类型能够透传到下游。默认只有 `function`。请求中 type 不在白名单内的 tool 会被静默过滤。例如，如果下游支持联网搜索：
+`server.allowed-tool-types` 控制哪些工具类型能够透传到下游。默认只有 `function`。请求中 type 不在允许列表内的 tool 会被静默过滤。例如，如果下游支持联网搜索：
 
 ```yaml
 server:
-  tool_type_allowlist:
+  allowed-tool-types:
     - function
     - web_search_preview
 ```
 
 ## 环境变量引用
 
-`base_url` 和 `api_key` 支持 `$变量名` 方式引用环境变量：
+`base-url` 和 `api-key` 支持 `$变量名` 方式引用环境变量：
 
 ```yaml
 provider:
-  base_url: $MY_BASE_URL        # 从环境变量读取
-  api_key: $DEEPSEEK_API_KEY    # 从环境变量读取
-  api_key: sk-明文密钥           # 静态密钥
+  base-url: $MY_BASE_URL        # 从环境变量读取
+  api-key: $DEEPSEEK_API_KEY    # 从环境变量读取
+  api-key: sk-明文密钥           # 静态密钥
 ```

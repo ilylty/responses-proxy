@@ -41,6 +41,7 @@ async fn main() {
     );
 
     let state = app::State::new(resolved);
+    state.store().start_sweep_task();
 
     // CORS: allow all origins unless explicitly restricted
     let cors = if state.config().cors_allow_origins.is_empty() {
@@ -53,7 +54,11 @@ async fn main() {
             .config()
             .cors_allow_origins
             .iter()
-            .map(|o| o.parse().unwrap())
+            .filter_map(|o| {
+                o.parse()
+                    .map_err(|e| tracing::warn!(origin = %o, error = %e, "Invalid CORS origin"))
+                    .ok()
+            })
             .collect();
         CorsLayer::new()
             .allow_origin(tower_http::cors::AllowOrigin::list(origins))
@@ -76,6 +81,10 @@ async fn main() {
         .route(
             "/v1/responses/compact",
             post(handlers::compact).route_layer(auth.clone()),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(handlers::input_tokens).route_layer(auth.clone()),
         )
         .route(
             "/v1/responses/{response_id}/cancel",

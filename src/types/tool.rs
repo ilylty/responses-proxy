@@ -1027,6 +1027,9 @@ pub struct NamespaceToolFunction {
     pub description: Option<String>,
     /// JSON Schema parameters.
     pub parameters: Option<serde_json::Value>,
+    /// Whether to enable strict mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 fn default_item_type_function() -> String {

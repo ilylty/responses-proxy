@@ -1,0 +1,166 @@
+# responses-proxy 配置。
+#
+# 当前项目读取 YAML，而不是 TOML。可以用下面的方式指定其他配置文件：
+#   responses-proxy --config /path/to/config.yaml
+
+# ── 服务端 ─────────────────────────────────────────────────────────────
+server:
+  # proxy 监听的地址和端口。
+  # 可选。默认值："0.0.0.0:3000"。
+  listen: "0.0.0.0:3000"
+
+  # 默认请求超时时间，单位为秒。
+  # 当某个模型 provider 没有设置 provider.timeout 时使用这个值。
+  # 可选。默认值：600。
+  timeout: 600
+
+  # 日志级别：trace | debug | info | warn | error。
+  # 可以被 RUST_LOG 覆盖。
+  # 可选。默认值：info。
+  log-level: info
+
+  # compact 摘要加密使用的 AES-256-GCM key（64 个十六进制字符 = 32 字节）。
+  # 当 compaction 流程里出现加密 compact payload 时使用。
+  # 空字符串表示关闭加密/解密支持。
+  # 可选。默认值：""。
+  compact-encryption-key: ""
+
+  # API key 认证。只要至少配置了一个 key，就会启用认证。
+  # 启用后，受保护接口需要：
+  #   Authorization: Bearer <这里配置的某个 key>
+  # /health 仍然开放。
+  # 可选。默认值：[]（关闭认证）。
+  auth:
+    keys: []
+    # 示例：
+    # keys:
+    #   - sk-your-secret-key-here
+
+  # CORS 允许的来源。
+  # 空列表表示允许任意来源。
+  # 可选。默认值：[]。
+  cors:
+    allow-origins: []
+    # 示例：
+    # allow-origins:
+    #   - http://localhost:5173
+    #   - https://example.com
+
+  # Responses tools 转换时允许的工具类型列表。
+  # 不支持或不允许的工具类型会在转换边界被拒绝或丢弃。
+  # 当前 Chat 兼容转换路径包含 function/custom。
+  # 可选。默认值：["function"]。
+  allowed-tool-types:
+    - function
+    # - custom
+
+# ── 模型 ─────────────────────────────────────────────────────────────
+# models 下面的每个 key 都是这个 proxy 对外暴露的模型名。
+# 可选的 "model" 字段是下游 provider 的真实模型名。
+models:
+  gpt-5.5:
+    # 发送给 Chat Completions provider 的下游模型名。
+    # 可选。默认等于这个 map key（"gpt-5.5"）。
+    model: deepseek-v4-pro
+
+    # 可选：provider 专用 JSON rewrite。这里可以写下面这种内联 rewrite profile，
+    # 也可以写顶层 "rewrites" 下的可复用 profile 名称，例如：rewrite: deepseek。
+    #
+    # 公开请求/响应 body 会先按
+    # OpenAI 兼容 typed struct 解析；rewrite 只是在固定阶段做 provider 兼容补丁：
+    # - response-in: 已解析的 Responses request JSON，执行 Responses -> Chat 之前
+    # - chat-out: 已转换的 Chat request JSON，发送给上游之前
+    # - chat-in: 上游 Chat response JSON，转换成 Responses 之前
+    # - response-out: 最终 Responses response JSON，返回客户端之前
+    # 每个阶段里的 rewrite 操作是链式执行，并且严格按配置书写顺序执行。
+    # 后面的规则会看到前面规则已经改过的值；同一个 path 上更具体的匹配
+    # 应该放在更宽泛的匹配前面。
+    # path 可以写普通字段名、点号路径，或 JSON pointer。
+    # 示例：
+    # - model                       # 普通字段名
+    # - reasoning.effort            # 点号路径
+    # - choices.0.finish_reason     # 带数组下标的点号路径
+    # - /response_format/type       # JSON pointer
+    # - /tools/0/function/name      # 带数组下标的 JSON pointer
+    #
+    # 操作：
+    # - reset: 仅当目标 path 已经存在时覆盖它；不存在则不新增
+    # - rename: 把一个 path 移动到另一个 path
+    # - remove: 删除 path
+    # - replace: 如果当前值匹配 "if"，先把 set 写入当前 replace key，
+    #   然后写入可选 with 里的每个条目
+    #   with 是有序的 target path -> JSON value map。
+    #   使用 with 里的 "" key 可以替换整个 body。
+    #   字符串形式的 "if" 是正则表达式。精确匹配请使用 ^...$。
+    #
+    # 下面的注释示例展示了一些常见 provider 兼容 rewrite。
+    # rewrite:
+    #   - at: response-in
+    #     reset:
+    #       max_output_tokens: 2048
+    #     replace:
+    #       reasoning.effort:
+    #         - if: none
+    #           set: null
+    #   - at: chat-out
+    #     rename:
+    #       max_completion_tokens: max_tokens
+    #     replace:
+    #       reasoning_effort:
+    #         - if: "^(high|xhigh)$"
+    #           set: max
+    #           with:
+    #             thinking:
+    #               type: enable
+    #         - if: "^(minimal|low|medium)$"
+    #           set: high
+    #           with:
+    #             provider_options.reasoning:
+    #               enabled: true
+    #               budget: 4096
+    #   - at: chat-in
+    #     remove:
+    #       - system_fingerprint
+    #     replace:
+    #       choices.0.finish_reason:
+    #         - if: length
+    #           set: stop
+    #   - at: response-out
+    #     remove:
+    #       - parallel_tool_calls
+    #     replace:
+    #       service_tier:
+    #         - if: auto
+    #           set: priority
+    #         - if: priority
+    #           set: default
+    provider:
+      # 下游 provider 的 API key。
+      # 以 "$" 开头的值会从环境变量读取。
+      # 必填。
+      api-key: $DEEPSEEK_API_KEY
+
+      # Chat Completions 兼容 base URL。
+      # proxy 会把请求发送到：{base-url}/chat/completions
+      # 必填。
+      base-url: https://api.deepseek.com
+
+      # 单个 provider 的超时时间，单位为秒。
+      # 可选。未设置时回退到 server.timeout。
+      timeout: 60
+
+  codex-auto-review:
+    # 示例：暴露另一个逻辑模型，但使用同一 provider 里的另一个下游模型。
+    model: deepseek-v4-flash
+    provider:
+      api-key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+
+# 可选：可复用 rewrite profiles。model 可以通过名称引用：
+# rewrite: deepseek
+#
+# rewrites:
+#   deepseek:
+#     at: chat-out
+#     rename:
+#       max_completion_tokens: max_tokens

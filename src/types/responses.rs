@@ -1,4 +1,5 @@
-//! Responses API — request/response types for `POST /v1/responses`.
+//! Responses API — request/response types for `POST /v1/responses`, modeled
+//! from the official OpenAI Responses API reference.
 //!
 //! Every field is annotated with: required (`*`) / optional (`?`), default value,
 //! valid range, and whether the field can be `null`.
@@ -75,6 +76,10 @@ pub struct Request {
     #[serde(default = "default_one_f64", skip_serializing_if = "is_one_f64")]
     pub top_p: f64,
 
+    /// Stop generation when any of these sequences are generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<super::chat::Stop>,
+
     // ── Streaming ─────────────────────────────────────────────────────
     /// Enable SSE streaming.  Default: `false`.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -123,6 +128,11 @@ pub struct Request {
     /// Output verbosity.  Allowed: `"low"`, `"medium"` (default), `"high"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbosity: Option<super::Verbosity>,
+
+    /// Truncation strategy for context management.
+    /// Allowed: `"auto"` (truncate oldest), `"disabled"` (default — error on overflow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<super::TruncationStrategy>,
 
     // ── Include ───────────────────────────────────────────────────────
     /// Additional data to embed in the response object.
@@ -275,7 +285,7 @@ impl Default for Response {
             top_p: None,
             max_output_tokens: None,
             max_tool_calls: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: true,
             tools: Vec::new(),
             tool_choice: None,
             text: None,
@@ -331,8 +341,9 @@ fn is_one_f64(v: &f64) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Error {
-    /// Machine-readable error code.
-    pub code: String,
+    /// Machine-readable error code.  `None` / `null` indicates no specific code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// Human-readable error message.
     pub message: String,
     /// Error class, e.g. `"invalid_request_error"`.  Skipped when `None`.
@@ -376,6 +387,33 @@ impl Error {
     pub fn to_http_json(&self) -> serde_json::Value {
         serde_json::json!({ "error": self })
     }
+
+    pub fn server_error(msg: impl Into<String>) -> Self {
+        Self {
+            r#type: Some(Self::TYPE_SERVER_ERROR.into()),
+            code: Some(Self::CODE_SERVER_ERROR.into()),
+            message: msg.into(),
+            param: None,
+        }
+    }
+
+    pub fn invalid_request(msg: impl Into<String>) -> Self {
+        Self {
+            r#type: Some(Self::TYPE_INVALID_REQUEST.into()),
+            code: None,
+            message: msg.into(),
+            param: None,
+        }
+    }
+
+    pub fn invalid_request_with_param(msg: impl Into<String>, param: impl Into<String>) -> Self {
+        Self {
+            r#type: Some(Self::TYPE_INVALID_REQUEST.into()),
+            code: None,
+            message: msg.into(),
+            param: Some(param.into()),
+        }
+    }
 }
 
 // ── IncompleteDetails ──────────────────────────────────────────────────────
@@ -407,6 +445,7 @@ pub struct Usage {
 }
 
 /// Input token detail — only `cached_tokens` for now.
+/// Audio tokens are in the `prompt_tokens_details` downstream but not yet mapped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct InputTokensDetails {
@@ -415,6 +454,7 @@ pub struct InputTokensDetails {
 }
 
 /// Output token detail — only `reasoning_tokens` for now.
+/// Audio tokens are in the `completion_tokens_details` downstream but not yet mapped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OutputTokensDetails {
@@ -435,6 +475,11 @@ pub struct TextConfig {
     /// or `{"type": "json_object"}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<TextFormat>,
+
+    /// Output verbosity level. Allowed: `"low"`, `"medium"`, `"high"`.
+    /// Falls back to top-level `verbosity` if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<super::Verbosity>,
 }
 
 /// Output format discriminator — three variants.
@@ -534,6 +579,15 @@ pub enum ConversationResponse {
     Id(String),
     /// Object form.
     Object { id: String },
+}
+
+impl From<ConversationRequest> for ConversationResponse {
+    fn from(cr: ConversationRequest) -> Self {
+        match cr {
+            ConversationRequest::Id(id) => ConversationResponse::Id(id),
+            ConversationRequest::Object { id } => ConversationResponse::Object { id },
+        }
+    }
 }
 
 // ── Prompt ─────────────────────────────────────────────────────────────────
@@ -761,6 +815,7 @@ impl Default for Request {
             parallel_tool_calls: true,
             temperature: 1.0,
             top_p: 1.0,
+            stop: None,
             stream: false,
             stream_options: None,
             store: true,
@@ -771,6 +826,7 @@ impl Default for Request {
             prompt_cache_retention: None,
             service_tier: None,
             verbosity: None,
+            truncation: None,
             include: None,
             text: None,
             reasoning: None,
@@ -839,7 +895,7 @@ mod tests {
         assert!((req.top_p - 1.0).abs() < f64::EPSILON); // default 1
     }
 
-    // ── Unknown fields are accepted (validation layer catches errors) ──
+    // ── Unknown fields are accepted for provider compatibility ──
 
     #[test]
     fn test_new_params_allows_extra_fields() {

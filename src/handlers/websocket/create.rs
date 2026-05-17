@@ -1,11 +1,9 @@
 //! Handler for the `response.create` WebSocket event.
 
 use crate::convert::responses_to_chat;
-use crate::types::MessageRole;
+use crate::types::chat::{self, MessageRequest};
 use crate::types::event;
-use crate::types::item::{
-    FunctionCall, InputContentBlock, InputItem, InputMessage, Reasoning as InputReasoning,
-};
+use crate::types::event::StreamEvent;
 use crate::types::responses::{Error, Request, Response, ResponseStatus};
 use crate::types::streaming::*;
 use crate::types::websocket;
@@ -25,69 +23,88 @@ fn ws_response(rid: &str, model: &str, now: i64, status: ResponseStatus) -> Resp
 }
 
 /// Handle a `response.create` event: parse, forward to upstream, stream back results.
-pub(super) async fn handle(
-    state: &crate::app::State,
-    socket: &mut WebSocket,
-    mut req: Request,
-    history: &mut Vec<InputItem>,
-    last_rid: &mut Option<String>,
-) {
-    let model = req.model.clone();
+pub(super) async fn handle(state: &crate::app::State, socket: &mut WebSocket, mut req: Request) {
+    tracing::debug!("input items {}", req.input.len());
 
-    // Merge new input items with restored history
-    let new_items = std::mem::take(&mut req.input);
-
-    // Restore previous history if previous_response_id is provided
-    let prev_id = req.previous_response_id.clone();
-    let prev_len = if let Some(ref pid) = prev_id {
-        if let Some(existing) = state.history().get(pid).await {
-            let len = existing.len();
-            *history = existing;
-            len
-        } else {
-            // Doc: store=false + uncached → previous_response_not_found
-            if !req.store {
-                let ws_err = websocket::ErrorEvent::with_param(
-                    400,
-                    Error::TYPE_INVALID_REQUEST,
-                    "previous_response_not_found",
-                    format!("Previous response with id '{pid}' not found."),
-                    "previous_response_id",
-                );
-                super::send(socket, &ws_err.to_json_string()).await;
-                return;
-            }
-            history.clear();
-            0
-        }
-    } else {
-        history.clear();
-        0
-    };
-
-    history.extend(new_items);
-    req.input = history.clone();
-
-    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-    *last_rid = Some(rid.clone());
-
-    let provider = match state.config().models.get(&model) {
+    let provider = match state.config().models.get(&req.model) {
         Some(p) => p.clone(),
         None => {
             let ws_err = websocket::ErrorEvent::new(
                 400,
                 Error::TYPE_INVALID_REQUEST,
                 "model_not_found",
-                format!("Unknown model: {model}"),
+                format!("Unknown model: {}", req.model),
             );
             super::send(socket, &ws_err.to_json_string()).await;
             return;
         }
     };
 
-    // If generate=false, just echo lifecycle events without calling upstream
+    if !provider.rewrite.responses_in.is_empty() {
+        let mut body = match serde_json::to_value(&req) {
+            Ok(body) => body,
+            Err(e) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    500,
+                    Error::TYPE_SERVER_ERROR,
+                    Error::CODE_SERVER_ERROR,
+                    e.to_string(),
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        };
+        if let Err(message) =
+            crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.responses_in)
+        {
+            let ws_err = websocket::ErrorEvent::new(
+                500,
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                message,
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+        req = match serde_json::from_value(body) {
+            Ok(req) => req,
+            Err(e) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    400,
+                    Error::TYPE_INVALID_REQUEST,
+                    Error::CODE_SERVER_ERROR,
+                    e.to_string(),
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        };
+    }
+
+    let model = req.model.clone();
     let generate = req.generate;
+
+    let rid = format!("resp_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+    let mid = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+
+    // Convert to Chat API (responses_to_chat handles history + instructions)
+    let mut chat_req = match responses_to_chat(req, state).await {
+        Ok(cr) => cr,
+        Err(unsupported) => {
+            let ws_err = websocket::ErrorEvent::new(
+                400,
+                Error::TYPE_INVALID_REQUEST,
+                "unsupported_feature",
+                format!("Unsupported features: {}", unsupported.join(", ")),
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+    };
+    chat_req.model = provider.model.clone();
+    let mut full_input_messages = chat_req.messages.clone();
+
+    // If generate=false, just echo lifecycle events without calling upstream
     if !generate {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -97,47 +114,85 @@ pub(super) async fn handle(
         let resp_in_progress = ws_response(&rid, &model, now, ResponseStatus::InProgress);
         let resp_completed = ws_response(&rid, &model, now, ResponseStatus::Completed);
 
-        let created = serde_json::to_string(&event::Created {
-            response: resp_in_progress.clone(),
-            sequence_number: 0,
-        })
-        .unwrap_or_default();
-        super::send(socket, &created).await;
+        for event in [
+            StreamEvent::Created(event::Created {
+                response: resp_in_progress.clone(),
+                sequence_number: 0,
+            }),
+            StreamEvent::InProgress(event::InProgress {
+                response: resp_in_progress,
+                sequence_number: 1,
+            }),
+            StreamEvent::Completed(event::Completed {
+                response: resp_completed,
+                sequence_number: 2,
+            }),
+        ] {
+            match prepare_stream_event(event, &provider.rewrite.responses_out) {
+                Ok(prepared) => {
+                    super::send(socket, &prepared.body.to_string()).await;
+                }
+                Err(message) => {
+                    let ws_err = websocket::ErrorEvent::new(
+                        500,
+                        Error::TYPE_SERVER_ERROR,
+                        Error::CODE_SERVER_ERROR,
+                        message,
+                    );
+                    super::send(socket, &ws_err.to_json_string()).await;
+                    return;
+                }
+            }
+        }
 
-        let in_progress = serde_json::to_string(&event::InProgress {
-            response: resp_in_progress,
-            sequence_number: 1,
-        })
-        .unwrap_or_default();
-        super::send(socket, &in_progress).await;
-
-        let completed = serde_json::to_string(&event::Completed {
-            response: resp_completed,
-            sequence_number: 2,
-        })
-        .unwrap_or_default();
-        super::send(socket, &completed).await;
-
-        let delta = history[prev_len..].to_vec();
-        state.history().set(rid, delta, prev_id).await;
+        state.store().put(rid, full_input_messages).await;
         return;
     }
 
-    // Convert and forward to upstream Chat API
-    let mut chat_req = responses_to_chat(req, state);
-    chat_req.model = provider.model.clone();
-
     let url = format!("{}/chat/completions", provider.base_url);
-    let stream_resp = match state
+    let request = state
         .http_client()
         .post(&url)
         .timeout(provider.timeout)
         .header("Authorization", format!("Bearer {}", provider.api_key))
-        .header("Content-Type", "application/json")
-        .json(&chat_req)
-        .send()
-        .await
-    {
+        .header("Content-Type", "application/json");
+    let request = if provider.rewrite.chat_out.is_empty() {
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&chat_req).unwrap_or("".to_string())
+        );
+        request.json(&chat_req)
+    } else {
+        let mut body = match serde_json::to_value(&chat_req) {
+            Ok(body) => body,
+            Err(e) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    500,
+                    Error::TYPE_SERVER_ERROR,
+                    Error::CODE_SERVER_ERROR,
+                    e.to_string(),
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        };
+        if let Err(message) = crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out) {
+            let ws_err = websocket::ErrorEvent::new(
+                500,
+                Error::TYPE_SERVER_ERROR,
+                Error::CODE_SERVER_ERROR,
+                message,
+            );
+            super::send(socket, &ws_err.to_json_string()).await;
+            return;
+        }
+        tracing::debug!(
+            "chat request: {}",
+            serde_json::to_string(&body).unwrap_or("".to_string())
+        );
+        request.json(&body)
+    };
+    let stream_resp = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             let ws_err = websocket::ErrorEvent::new(
@@ -157,13 +212,12 @@ pub(super) async fn handle(
             status_code,
             Error::TYPE_SERVER_ERROR,
             Error::CODE_SERVER_ERROR,
-            format!("Upstream returned {status_code}"),
+            format!(
+                "Upstream error:  {}",
+                stream_resp.text().await.unwrap_or("".into())
+            ),
         );
         super::send(socket, &ws_err.to_json_string()).await;
-        // Doc: evict previous_response_id from cache on failure
-        if let Some(ref pid) = prev_id {
-            state.history().remove(pid).await;
-        }
         return;
     }
 
@@ -174,87 +228,112 @@ pub(super) async fn handle(
         .as_secs() as i64;
 
     let resp = ws_response(&rid, &model, now, ResponseStatus::InProgress);
-    super::send(
-        socket,
-        &serde_json::to_string(&event::Created {
+    let mut initial_events = Vec::new();
+    for event in [
+        StreamEvent::Created(event::Created {
             response: resp.clone(),
             sequence_number: 0,
-        })
-        .unwrap_or_default(),
-    )
-    .await;
-    super::send(
-        socket,
-        &serde_json::to_string(&event::InProgress {
+        }),
+        StreamEvent::InProgress(event::InProgress {
             response: resp,
             sequence_number: 1,
-        })
-        .unwrap_or_default(),
-    )
-    .await;
+        }),
+    ] {
+        match prepare_stream_event(event, &provider.rewrite.responses_out) {
+            Ok(prepared) => {
+                initial_events.push(prepared.event);
+                super::send(socket, &prepared.body.to_string()).await;
+            }
+            Err(message) => {
+                let ws_err = websocket::ErrorEvent::new(
+                    500,
+                    Error::TYPE_SERVER_ERROR,
+                    Error::CODE_SERVER_ERROR,
+                    message,
+                );
+                super::send(socket, &ws_err.to_json_string()).await;
+                return;
+            }
+        }
+    }
+
+    // Register cancellation token for HTTP cancel endpoint
+    let cancel_rx = state.store().register_cancel_token(&rid).await;
 
     // Stream loop: read SSE chunks + handle cancel
-    let (ss, cancelled) = run_stream(socket, stream_resp, &rid, &mid, &model).await;
+    let stream_context = WsStreamContext {
+        rid: &rid,
+        mid: &mid,
+        model: &model,
+        chat_in: &provider.rewrite.chat_in,
+        responses_out: &provider.rewrite.responses_out,
+        now,
+        compact_key: state.compact_key(),
+    };
+    let (response_msg, cancelled, stream_events) =
+        run_stream(socket, stream_resp, stream_context, cancel_rx).await;
+    let events = initial_events;
+    // stream_events are already sent, just used for counting
+    let total_events = events.len() + stream_events.len();
+
+    // Clean up cancel token (run_stream already handled the actual cancellation check)
+    state.store().unregister_cancel_token(&rid).await;
 
     // Persist accumulated history
     if !cancelled {
-        if !ss.reasoning_content.is_empty() {
-            history.push(InputItem::Reasoning(InputReasoning {
-                id: format!("rs_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
-                summary: vec![],
-                content: None,
-                encrypted_content: None,
-                status: Some("completed".into()),
-            }));
-        }
-
-        history.push(InputItem::Message(InputMessage {
-            role: MessageRole::Assistant,
-            content: if ss.accumulated_text.is_empty() {
-                vec![]
-            } else {
-                vec![InputContentBlock::Text {
-                    text: ss.accumulated_text.clone(),
-                }]
-            },
-            status: None,
-        }));
-
-        for tc in &ss.tool_calls {
-            if !tc.id.is_empty() {
-                history.push(InputItem::FunctionCall(FunctionCall {
-                    call_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                    id: None,
-                    namespace: None,
-                    status: Some("completed".into()),
-                }));
-            }
-        }
-
-        let delta = history[prev_len..].to_vec();
-        state.history().set(rid, delta, prev_id).await;
-        tracing::info!(history_items = history.len(), "WS: stored history");
+        // Append assistant response to input messages and store
+        let assistant_msg: MessageRequest = response_msg.into();
+        let has_reasoning =
+            matches!(&assistant_msg, MessageRequest::Assistant(a) if a.reasoning_content.is_some());
+        tracing::info!(
+            total_events,
+            has_reasoning,
+            msg_count = full_input_messages.len() + 1,
+            "WS: storing history"
+        );
+        full_input_messages.push(assistant_msg);
+        state.store().put(rid, full_input_messages).await;
     }
 }
 
 /// Relay SSE chunks from upstream to WebSocket, with cancel detection.
+/// Returns (response_message, cancelled, collected_events).
+struct WsStreamContext<'a> {
+    rid: &'a str,
+    mid: &'a str,
+    model: &'a str,
+    chat_in: &'a crate::config::RewriteConfig,
+    responses_out: &'a crate::config::RewriteConfig,
+    now: i64,
+    compact_key: Option<&'a [u8; 32]>,
+}
+
 async fn run_stream(
     socket: &mut WebSocket,
     stream_resp: reqwest::Response,
-    rid: &str,
-    mid: &str,
-    model: &str,
-) -> (StreamState, bool) {
+    context: WsStreamContext<'_>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) -> (chat::ResponseMessage, bool, Vec<StreamEvent>) {
     let mut buf = String::new();
-    let mut ss = StreamState::new(rid.to_string(), mid.to_string(), model.to_string());
-    let mut seq: u64 = 2;
+    let mut ss = StreamState::new(
+        context.rid.to_string(),
+        context.mid.to_string(),
+        context.model.to_string(),
+    );
+    ss.has_started = true;
+    ss.created = context.now;
+    ss.compact_key = context.compact_key.copied();
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
+    let mut collected_events: Vec<StreamEvent> = Vec::new();
 
     loop {
         tokio::select! {
+            _ = cancel_rx.changed() => {
+                tracing::info!(response_id = %context.rid, "WS stream cancelled via HTTP");
+                cancelled = true;
+                break;
+            }
             chunk = byte_stream.next() => {
                 match chunk {
                     Some(Ok(b)) => {
@@ -267,22 +346,38 @@ async fn run_stream(
                                 .and_then(|l| l.strip_prefix("data:").map(|s| s.trim()))
                             {
                                 tracing::trace!(%data, "Chat API delta");
-                                if let Some(events) = process_chunk(&mut ss, data) {
-                                    for evt in events {
-                                        let mut j = serde_json::to_value(&evt).unwrap();
-                                        let et_name = j["type"].as_str().unwrap_or("").to_string();
-                                        j["sequence_number"] = serde_json::json!(seq);
-                                        seq += 1;
-                                        if !et_name.ends_with("delta") {
-                                            tracing::info!("WS event: {et_name}");
-                                            tracing::debug!("WS event details: {}", j);
+                                match process_upstream_stream_data(
+                                    &mut ss,
+                                    data,
+                                    context.chat_in,
+                                    context.responses_out,
+                                ) {
+                                    Ok(events) => {
+                                        for prepared in events {
+                                            if !prepared.event_type.ends_with("delta") {
+                                                tracing::info!("WS event: {}", prepared.event_type);
+                                                tracing::debug!("WS event details: {}", prepared.body);
+                                            }
+                                            let msg = prepared.body.to_string();
+                                            tracing::debug!("WS send: {msg}");
+                                            collected_events.push(prepared.event);
+                                            if socket.send(WsMsg::Text(msg.into())).await.is_err() {
+                                                tracing::info!("WS send failed");
+                                                return (ss.to_response_message(), false, collected_events);
+                                            }
                                         }
-                                        let msg = j.to_string();
+                                    }
+                                    Err(message) => {
+                                        let ws_err = websocket::ErrorEvent::new(
+                                            500,
+                                            Error::TYPE_SERVER_ERROR,
+                                            Error::CODE_SERVER_ERROR,
+                                            message,
+                                        );
+                                        let msg = ws_err.to_json_string();
                                         tracing::debug!("WS send: {msg}");
-                                        if socket.send(WsMsg::Text(msg.into())).await.is_err() {
-                                            tracing::info!("WS send failed");
-                                            return (ss, false);
-                                        }
+                                        let _ = socket.send(WsMsg::Text(msg.into())).await;
+                                        return (ss.to_response_message(), false, collected_events);
                                     }
                                 }
                             }
@@ -305,5 +400,43 @@ async fn run_stream(
             }
         }
     }
-    (ss, cancelled)
+    (ss.to_response_message(), cancelled, collected_events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_response_builds_correctly() {
+        let resp = ws_response("resp_1", "gpt-5", 1000, ResponseStatus::InProgress);
+        assert_eq!(resp.id, "resp_1");
+        assert_eq!(resp.model, "gpt-5");
+        assert_eq!(resp.created_at, 1000);
+        assert_eq!(resp.status, ResponseStatus::InProgress);
+        assert!(resp.parallel_tool_calls);
+        assert!(resp.output.is_empty());
+    }
+
+    #[test]
+    fn ws_response_completed_status() {
+        let resp = ws_response("resp_x", "claude", 500, ResponseStatus::Completed);
+        assert_eq!(resp.status, ResponseStatus::Completed);
+    }
+
+    #[test]
+    fn ws_response_all_statuses() {
+        let statuses = &[
+            ResponseStatus::Queued,
+            ResponseStatus::InProgress,
+            ResponseStatus::Completed,
+            ResponseStatus::Failed,
+            ResponseStatus::Incomplete,
+            ResponseStatus::Cancelled,
+        ];
+        for st in statuses {
+            let resp = ws_response("r", "m", 0, *st);
+            assert_eq!(resp.id, "r");
+        }
+    }
 }

@@ -36,6 +36,8 @@ bytes = "1"
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+rustc-hash = "2"
+regex = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"

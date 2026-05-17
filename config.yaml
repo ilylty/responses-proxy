@@ -1,48 +1,169 @@
+# responses-proxy configuration.
+#
+# This project currently loads YAML, not TOML. Pass a different file with:
+#   responses-proxy --config /path/to/config.yaml
+
 # ── Server ─────────────────────────────────────────────────────────────
 server:
-  # Listen address. Default: "0.0.0.0:3000" (optional)
+  # Address and port the proxy listens on.
+  # Optional. Default: "0.0.0.0:3000".
   listen: "0.0.0.0:3000"
 
-  # Default request timeout in seconds. Default: 600 (optional)
+  # Default request timeout in seconds.
+  # Used when a model provider does not set provider.timeout.
+  # Optional. Default: 600.
   timeout: 600
 
   # Log level: trace | debug | info | warn | error.
-  # Can be overridden by RUST_LOG. Default: info (optional)
-  log_level: info
+  # Can be overridden by RUST_LOG.
+  # Optional. Default: info.
+  log-level: info
 
   # AES-256-GCM key for compact summary encryption (64 hex chars = 32 bytes).
-  # Default: "" (no encryption) (optional)
-  compact_encryption_key: ""
+  # Used by compaction flows when encrypted compaction payloads are present.
+  # Empty string disables decryption/encryption support.
+  # Optional. Default: "".
+  compact-encryption-key: ""
 
   # API key authentication. If at least one key is present, auth is enabled.
-  # Default: no keys (auth disabled) (optional)
+  # When enabled, authenticated endpoints require:
+  #   Authorization: Bearer <one of these keys>
+  # /health remains open.
+  # Optional. Default: [] (auth disabled).
   auth:
     keys: []
     # Example:
     # keys:
     #   - sk-your-secret-key-here
 
-  # CORS allow origins. Empty = allow any origin. Default: [] (optional)
+  # CORS allow origins.
+  # Empty list means allow any origin.
+  # Optional. Default: [].
   cors:
-    allow_origins: []
+    allow-origins: []
+    # Example:
+    # allow-origins:
+    #   - http://localhost:5173
+    #   - https://example.com
 
-  # Tool type allowlist. Default: ["function"] (optional)
-  tool_type_allowlist:
+  # Allowed tool types for Responses tools accepted by the converter.
+  # Unsupported or disallowed tool types are rejected/dropped at conversion boundaries.
+  # Chat-compatible types currently include function/custom conversion paths.
+  # Optional. Default: ["function"].
+  allowed-tool-types:
     - function
+    # - custom
 
 # ── Models ─────────────────────────────────────────────────────────────
+# Each key under models is the model name exposed by this proxy.
+# The optional "model" field is the downstream provider model name.
 models:
   gpt-5.5:
-    # Downstream model name. Defaults to the key name. (optional)
+    # Downstream model name sent to the Chat Completions provider.
+    # Optional. Defaults to this map key ("gpt-5.5").
     model: deepseek-v4-pro
+
+    # Optional provider-specific JSON rewrites. This can be either an inline
+    # rewrite profile like the example below, or the name of a top-level
+    # reusable profile under "rewrites", for example: rewrite: deepseek.
+    #
+    # Public request/response
+    # bodies are first parsed as OpenAI-compatible typed structs; rewrites
+    # are only provider-compatibility patches at fixed pipeline stages:
+    # - response-in: parsed Responses request JSON before Responses -> Chat
+    # - chat-out: converted Chat request JSON before sending upstream
+    # - chat-in: upstream Chat response JSON before converting to Responses
+    # - response-out: final Responses response JSON before returning
+    # Rewrite operations are chained and run in the same order they are listed
+    # in each stage. Later rules see changes made by earlier rules, so put
+    # more specific matches before broader matches when they touch the same path.
+    # Paths can be plain field names, dotted paths, or JSON pointers.
+    # Examples:
+    # - model                       # plain field name
+    # - reasoning.effort            # dotted path
+    # - choices.0.finish_reason     # dotted path with an array index
+    # - /response_format/type       # JSON pointer
+    # - /tools/0/function/name      # JSON pointer with an array index
+    #
+    # Operations:
+    # - reset: overwrite a path only when the target path already exists
+    # - rename: move one path to another path
+    # - remove: delete paths
+    # - replace: if current value matches "if", write set to the current
+    #   replace key, then write each optional with entry
+    #   With is an ordered map of target path -> JSON value. Use "" as a
+    #   with key to replace the whole body.
+    #   String "if" values are regex patterns. Use ^...$ for exact matches.
+    #
+    # The commented example below shows common provider compatibility rewrites.
+    # rewrite:
+    #   - at: response-in
+    #     reset:
+    #       max_output_tokens: 2048
+    #     replace:
+    #       reasoning.effort:
+    #         - if: none
+    #           set: null
+    #   - at: chat-out
+    #     rename:
+    #       max_completion_tokens: max_tokens
+    #     replace:
+    #       reasoning_effort:
+    #         - if: "^(high|xhigh)$"
+    #           set: max
+    #           with:
+    #             thinking:
+    #               type: enable
+    #         - if: "^(minimal|low|medium)$"
+    #           set: high
+    #           with:
+    #             provider_options.reasoning:
+    #               enabled: true
+    #               budget: 4096
+    #   - at: chat-in
+    #     remove:
+    #       - system_fingerprint
+    #     replace:
+    #       choices.0.finish_reason:
+    #         - if: length
+    #           set: stop
+    #   - at: response-out
+    #     remove:
+    #       - parallel_tool_calls
+    #     replace:
+    #       service_tier:
+    #         - if: auto
+    #           set: priority
+    #         - if: priority
+    #           set: default
     provider:
-      api_key: $DEEPSEEK_API_KEY
-      base_url: https://api.deepseek.com
-      # Per-provider timeout in seconds. Falls back to server.timeout. (optional)
+      # API key for the downstream provider.
+      # Values beginning with "$" are read from the environment.
+      # Required.
+      api-key: $DEEPSEEK_API_KEY
+
+      # Chat Completions compatible base URL.
+      # The proxy sends requests to: {base-url}/chat/completions
+      # Required.
+      base-url: https://api.deepseek.com
+
+      # Per-provider timeout in seconds.
+      # Optional. Falls back to server.timeout.
       timeout: 60
 
   codex-auto-review:
+    # Example of exposing another logical model backed by a different
+    # downstream model on the same provider.
     model: deepseek-v4-flash
     provider:
-      api_key: $DEEPSEEK_API_KEY
-      base_url: https://api.deepseek.com
+      api-key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+
+# Optional reusable rewrite profiles. Models can reference one by name with:
+# rewrite: deepseek
+#
+# rewrites:
+#   deepseek:
+#     at: chat-out
+#     rename:
+#       max_completion_tokens: max_tokens

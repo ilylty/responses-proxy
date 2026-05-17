@@ -1,0 +1,60 @@
+server:
+  listen: "0.0.0.0:3000"
+  timeout: 600
+  log-level: debug
+  allowed-tool-types:
+    - function
+
+models:
+  gpt-5.5:
+    model: deepseek-v4-pro
+    rewrite: deepseek
+    provider:
+      api-key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+
+  codex-auth-review:
+    model: deepseek-v4-flash
+    rewrite: deepseek
+    provider:
+      api-key: $DEEPSEEK_API_KEY
+      base-url: https://api.deepseek.com
+
+rewrites:
+  deepseek:
+    at: chat-out
+    rename:
+      max_completion_tokens: max_tokens
+    replace:
+      messages.*.role:
+        - if: "^developer$"
+          set: system
+      reasoning_effort:
+        # Responses API: none -> DeepSeek: disabled
+        - if: "^none$"
+          with:
+            thinking:
+              type: disabled
+        # Rewrite rules are chained in the order written. Handle high/xhigh
+        # before broad rules that would change reasoning_effort.
+        - if: "^(high|xhigh)$"
+          set: max
+          with:
+            thinking:
+              type: enabled
+        - if: "^(minimal|low|medium)$"
+          set: high
+          with:
+            thinking:
+              type: enabled
+        # DeepSeek reasoning_effort only accepts high / max
+      response_format.type:
+        - if: "^json_schema$"
+          set: json_object
+    remove:
+      - store
+      - verbosity
+      - prompt_cache_key
+      - parallel_tool_calls
+      - response_format.json_schema
+      - stream_options.include_obfuscation

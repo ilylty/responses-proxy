@@ -1,7 +1,9 @@
 /// Verification tests: real code with realistic payloads.
 /// Run with: cargo test verification
 use responses_proxy::convert::{chat_to_responses, responses_to_chat};
-use responses_proxy::types::streaming::{StreamEvent, StreamState, process_chunk};
+use responses_proxy::types::streaming::{
+    StreamEvent, StreamState, build_completion_events, process_chunk_value,
+};
 use responses_proxy::types::{chat, responses};
 use serde_json::json;
 
@@ -12,7 +14,7 @@ fn test_state() -> responses_proxy::app::State {
         timeout: 30,
         auth_keys: std::collections::HashSet::new(),
         cors_allow_origins: vec![],
-        tool_type_allowlist: vec!["function".into()],
+        allowed_tool_types: vec!["function".into()],
         log_level: "info".into(),
         models: std::collections::HashMap::new(),
         model_names: vec![],
@@ -21,17 +23,57 @@ fn test_state() -> responses_proxy::app::State {
     responses_proxy::app::State::new(config)
 }
 
+fn test_state_with_rewrite(
+    rewrite: responses_proxy::config::RewriteConfig,
+) -> responses_proxy::app::State {
+    use responses_proxy::config::{ResolvedConfig, ResolvedProvider, RewriteProfile};
+    use std::time::Duration;
+
+    let mut models = std::collections::HashMap::new();
+    models.insert(
+        "gpt-5.5".into(),
+        ResolvedProvider {
+            base_url: "http://example.test".into(),
+            api_key: "test-key".into(),
+            model: "upstream-model".into(),
+            timeout: Duration::from_secs(30),
+            rewrite: RewriteProfile {
+                chat_out: rewrite,
+                ..Default::default()
+            },
+        },
+    );
+
+    let config = ResolvedConfig {
+        listen: String::new(),
+        timeout: 30,
+        auth_keys: std::collections::HashSet::new(),
+        cors_allow_origins: vec![],
+        allowed_tool_types: vec!["function".into()],
+        log_level: "info".into(),
+        models,
+        model_names: vec!["gpt-5.5".into()],
+        compact_encryption_key: String::new(),
+    };
+    responses_proxy::app::State::new(config)
+}
+
+fn deepseek_chat_out_rewrite() -> responses_proxy::config::RewriteConfig {
+    let config = responses_proxy::config::load_config("deepseek.config.yaml").unwrap();
+    config.models["gpt-5.5"].rewrite.chat_out.clone()
+}
+
 // ── Scenario 1: Simple text, no streaming ────────────────────────────
 
-#[test]
-fn s1_simple_text_request() {
+#[tokio::test]
+async fn s1_simple_text_request() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "What is 2+2? Reply with just the number."
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["model"], "gpt-5.5");
@@ -45,8 +87,8 @@ fn s1_simple_text_request() {
     assert!(j.get("reasoning_effort").is_none());
 }
 
-#[test]
-fn s1_simple_text_response() {
+#[tokio::test]
+async fn s1_simple_text_response() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-abc123",
         "object": "chat.completion",
@@ -66,7 +108,7 @@ fn s1_simple_text_response() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     assert_eq!(j["object"], "response");
@@ -90,8 +132,8 @@ fn s1_simple_text_response() {
 
 // ── Scenario 2: Instructions + Reasoning xhigh ───────────────────────
 
-#[test]
-fn s2_instructions_and_reasoning_request() {
+#[tokio::test]
+async fn s2_instructions_and_reasoning_request() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Solve the complex equation.",
@@ -100,17 +142,8 @@ fn s2_instructions_and_reasoning_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
-    let mut j = serde_json::to_value(&chat).unwrap();
-    // DeepSeek provider patch
-    if j.get("reasoning_effort").is_some() {
-        j["thinking"] = json!({"type": "enabled"});
-    }
-    // Map "xhigh" → "max" for DeepSeek
-    if j["reasoning_effort"] == "xhigh" {
-        j["reasoning_effort"] = json!("max");
-    }
-
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
     let msgs = j["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0]["role"], "system");
@@ -120,12 +153,11 @@ fn s2_instructions_and_reasoning_request() {
     );
     assert_eq!(msgs[1]["role"], "user");
 
-    assert_eq!(j["thinking"]["type"], "enabled");
-    assert_eq!(j["reasoning_effort"], "max");
+    assert_eq!(j["reasoning_effort"], "xhigh");
 }
 
-#[test]
-fn s2_reasoning_content_response() {
+#[tokio::test]
+async fn s2_reasoning_content_response() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-def456",
         "object": "chat.completion",
@@ -149,7 +181,7 @@ fn s2_reasoning_content_response() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     let output = j["output"].as_array().unwrap();
@@ -167,15 +199,15 @@ fn s2_reasoning_content_response() {
 
 // ── Scenario 3: All reasoning effort levels ──────────────────────────
 
-#[test]
-fn s3_reasoning_effort_all_levels() {
+#[tokio::test]
+async fn s3_reasoning_effort_all_levels() {
     let cases = &[
-        ("none", false, None),
-        ("minimal", true, Some("high")),
-        ("low", true, Some("high")),
-        ("medium", true, Some("high")),
+        ("none", true, Some("none")),
+        ("minimal", true, Some("minimal")),
+        ("low", true, Some("low")),
+        ("medium", true, Some("medium")),
         ("high", true, Some("high")),
-        ("xhigh", true, Some("max")),
+        ("xhigh", true, Some("xhigh")),
     ];
 
     for (effort, expect_think, expect_re) in cases {
@@ -186,24 +218,12 @@ fn s3_reasoning_effort_all_levels() {
         }))
         .unwrap();
 
-        let chat = responses_to_chat(req, &test_state());
-        let mut j = serde_json::to_value(&chat).unwrap();
-        // DeepSeek provider patch
-        if j.get("reasoning_effort").is_some() {
-            j["thinking"] = json!({"type": "enabled"});
-        }
-        if j["reasoning_effort"] == "xhigh" {
-            j["reasoning_effort"] = json!("max");
-        }
+        let chat = responses_to_chat(req, &test_state()).await.unwrap();
+        let j = serde_json::to_value(&chat).unwrap();
 
         if *expect_think {
-            assert_eq!(j["thinking"]["type"], "enabled", "effort={effort}");
             assert_eq!(j["reasoning_effort"], expect_re.unwrap(), "effort={effort}");
         } else {
-            assert!(
-                j.get("thinking").is_none(),
-                "effort={effort} should have no thinking"
-            );
             assert!(
                 j.get("reasoning_effort").is_none(),
                 "effort={effort} should have no reasoning_effort"
@@ -212,10 +232,25 @@ fn s3_reasoning_effort_all_levels() {
     }
 }
 
+#[tokio::test]
+async fn s3_reasoning_summary_without_effort_does_not_force_effort() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.5",
+        "input": "Hi",
+        "reasoning": {"summary": "auto"}
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+
+    assert!(j.get("reasoning_effort").is_none());
+}
+
 // ── Scenario 4: Thinking mode with reasoning ────────────────────────
 
-#[test]
-fn s4_thinking_disables_logprobs() {
+#[tokio::test]
+async fn s4_thinking_disables_logprobs() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
@@ -223,7 +258,7 @@ fn s4_thinking_disables_logprobs() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     // Reasoning present -> no logprobs fields sent downstream
@@ -233,8 +268,8 @@ fn s4_thinking_disables_logprobs() {
 
 // ── Scenario 5: Full tool conversation roundtrip ─────────────────────
 
-#[test]
-fn s5_tool_conversation_request() {
+#[tokio::test]
+async fn s5_tool_conversation_request() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -246,7 +281,7 @@ fn s5_tool_conversation_request() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -263,8 +298,8 @@ fn s5_tool_conversation_request() {
     assert_eq!(msgs[3]["content"], "NYC is sunny, 72F.");
 }
 
-#[test]
-fn s5_tool_call_response() {
+#[tokio::test]
+async fn s5_tool_call_response() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-tools",
         "object": "chat.completion",
@@ -286,7 +321,7 @@ fn s5_tool_call_response() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     let output = j["output"].as_array().unwrap();
@@ -299,8 +334,8 @@ fn s5_tool_call_response() {
 
 // ── Scenario 6: Content filter ───────────────────────────────────────
 
-#[test]
-fn s6_content_filter_response() {
+#[tokio::test]
+async fn s6_content_filter_response() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-cf",
         "object": "chat.completion",
@@ -314,7 +349,7 @@ fn s6_content_filter_response() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     // content_filter with incomplete_details → overall status is "incomplete" per doc
@@ -327,8 +362,8 @@ fn s6_content_filter_response() {
 
 // ── Scenario 7: Error response ───────────────────────────────────────
 
-#[test]
-fn s7_error_response() {
+#[tokio::test]
+async fn s7_error_response() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "",
         "object": "error",
@@ -339,7 +374,7 @@ fn s7_error_response() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     assert_eq!(j["status"], "failed");
@@ -350,14 +385,14 @@ fn s7_error_response() {
 
 // ── Scenario 8: All finish reasons ───────────────────────────────────
 
-#[test]
-fn s8_finish_reason_all() {
+#[tokio::test]
+async fn s8_finish_reason_all() {
     let cases = &[
         ("stop", "completed", &None),
         ("tool_calls", "completed", &None),
         ("length", "completed", &Some("max_output_tokens")),
         ("content_filter", "incomplete", &Some("content_filter")),
-        ("insufficient_system_resource", "incomplete", &None),
+        ("insufficient_system_resource", "completed", &None),
     ];
 
     for (reason, exp_status, exp_details) in cases {
@@ -374,7 +409,7 @@ fn s8_finish_reason_all() {
         }))
         .unwrap();
 
-        let resp = chat_to_responses(chat, "gpt-5.5".into());
+        let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
         let j = serde_json::to_value(&resp).unwrap();
 
         assert_eq!(
@@ -403,8 +438,8 @@ fn s8_finish_reason_all() {
 
 // ── Scenario 9: Tool normalization (flat→nested, allowlist filter) ──
 
-#[test]
-fn s9_tool_normalization() {
+#[tokio::test]
+async fn s9_tool_normalization() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
@@ -415,21 +450,19 @@ fn s9_tool_normalization() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let tools = j["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1); // web_search_preview filtered
+    assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
-    assert_eq!(tools[0]["function"]["description"], "Weather");
-    assert_eq!(tools[0]["function"]["strict"], true);
 }
 
 // ── Scenario 10: Response format from text.format ────────────────────
 
-#[test]
-fn s10_text_format_to_response_format() {
+#[tokio::test]
+async fn s10_text_format_to_response_format() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Output JSON",
@@ -437,21 +470,190 @@ fn s10_text_format_to_response_format() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["response_format"]["type"], "json_object");
 }
 
-#[test]
-fn s10_no_text_no_response_format() {
+#[tokio::test]
+async fn s10_json_schema_is_preserved() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.5",
+        "input": "Output JSON",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "description": "An answer object",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        }
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+
+    assert_eq!(j["response_format"]["type"], "json_schema");
+    assert_eq!(j["response_format"]["json_schema"]["name"], "answer");
+    assert_eq!(
+        j["response_format"]["json_schema"]["schema"]["properties"]["answer"]["type"],
+        "string"
+    );
+    assert_eq!(j["response_format"]["json_schema"]["strict"], true);
+}
+
+#[tokio::test]
+async fn s10_max_output_and_parallel_false_are_preserved() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.5",
+        "input": "Hi",
+        "max_output_tokens": 123,
+        "parallel_tool_calls": false
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+
+    assert_eq!(j["max_completion_tokens"], 123);
+    assert!(j.get("max_tokens").is_none());
+    assert_eq!(j["parallel_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn s10_max_output_tokens_can_map_to_deprecated_max_tokens_by_config() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.5",
+        "input": "Hi",
+        "max_output_tokens": 123
+    }))
+    .unwrap();
+    let state = test_state_with_rewrite(responses_proxy::config::RewriteConfig {
+        steps: vec![responses_proxy::config::RewriteStep::Rename(vec![(
+            "max_completion_tokens".into(),
+            "max_tokens".into(),
+        )])],
+    });
+
+    let chat = responses_to_chat(req, &state).await.unwrap();
+    let provider = state.config().models.get("gpt-5.5").unwrap();
+    let mut j = serde_json::to_value(&chat).unwrap();
+    responses_proxy::rewrite::apply_rewrite(&mut j, &provider.rewrite.chat_out).unwrap();
+
+    assert_eq!(j["max_tokens"], 123);
+    assert!(j.get("max_completion_tokens").is_none());
+}
+
+#[tokio::test]
+async fn deepseek_rewrite_preview() {
+    let rewrite = deepseek_chat_out_rewrite();
+
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+        let req: responses::Request = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": "Output JSON",
+            "max_output_tokens": 123,
+            "reasoning": {"effort": effort},
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    },
+                    "strict": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let chat = responses_to_chat(req, &test_state()).await.unwrap();
+        let mut body = serde_json::to_value(&chat).unwrap();
+        responses_proxy::rewrite::apply_rewrite(&mut body, &rewrite).unwrap();
+
+        println!(
+            "{effort}:\n{}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn deepseek_rewrite_reasoning_request_before_after() {
+    let rewrite = deepseek_chat_out_rewrite();
+
+    let request_body = json!({
+        "model": "gpt-5.5",
+        "input": "Output JSON",
+        "max_output_tokens": 123,
+        "reasoning": {"effort": "high"},
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        }
+    });
+
+    let req: responses::Request = serde_json::from_value(request_body.clone()).unwrap();
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let before_rewrite = serde_json::to_value(&chat).unwrap();
+    let mut after_rewrite = before_rewrite.clone();
+    responses_proxy::rewrite::apply_rewrite(&mut after_rewrite, &rewrite).unwrap();
+
+    println!(
+        "responses request:\n{}",
+        serde_json::to_string_pretty(&request_body).unwrap()
+    );
+    println!(
+        "chat before rewrite:\n{}",
+        serde_json::to_string_pretty(&before_rewrite).unwrap()
+    );
+    println!(
+        "chat after rewrite:\n{}",
+        serde_json::to_string_pretty(&after_rewrite).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn s10_prompt_is_rejected_until_supported() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.5",
+        "prompt": {"id": "pmpt_123"}
+    }))
+    .unwrap();
+
+    let err = responses_to_chat(req, &test_state()).await.unwrap_err();
+    assert!(err.contains(&"prompt".to_string()));
+}
+
+#[tokio::test]
+async fn s10_no_text_no_response_format() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi"
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert!(j.get("response_format").is_none());
@@ -459,31 +661,34 @@ fn s10_no_text_no_response_format() {
 
 // ── Scenario 11: Passthrough fields (temperature, top_p, etc.) ──────
 
-#[test]
-fn s11_passthrough_fields() {
+#[tokio::test]
+async fn s11_passthrough_fields() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
         "temperature": 0.7,
         "top_p": 0.9,
         "max_output_tokens": 2048,
+        "stop": ["END"],
         "tool_choice": "required"
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["temperature"], 0.7);
     assert_eq!(j["top_p"], 0.9);
-    assert_eq!(j["max_tokens"], 2048);
+    assert_eq!(j["max_completion_tokens"], 2048);
+    assert!(j.get("max_tokens").is_none());
+    assert_eq!(j["stop"][0], "END");
     assert_eq!(j["tool_choice"], "required");
 }
 
 // ── Scenario 12: Streaming usage chunk ───────────────────────────────
 
-#[test]
-fn s12_streaming_usage_captured() {
+#[tokio::test]
+async fn s12_streaming_usage_captured() {
     let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
@@ -492,16 +697,16 @@ fn s12_streaming_usage_captured() {
     state.accumulated_text = "Answer".into();
 
     // Usage-only chunk (needs all required ChatCompletionChunk fields)
-    let events = process_chunk(
+    let events = process_chunk_value(
         &mut state,
-        r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}"#,
+        serde_json::from_str(r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1715550000,"model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}"#).unwrap(),
     );
     assert!(events.is_none());
     assert!(state.usage.is_some());
     assert_eq!(state.usage.as_ref().unwrap().prompt_tokens, 10);
 
     // [DONE] includes usage
-    let events = process_chunk(&mut state, "[DONE]").unwrap();
+    let events = build_completion_events(&mut state);
     let completed = events
         .iter()
         .find(|e| matches!(e, StreamEvent::Completed(_)))
@@ -522,17 +727,17 @@ fn s12_streaming_usage_captured() {
 
 // ── Scenario 13: Streaming output_index no duplicates ────────────────
 
-#[test]
-fn s13_streaming_output_index_unique() {
+#[tokio::test]
+async fn s13_streaming_output_index_unique() {
     let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    let events = process_chunk(
+    let events = process_chunk_value(
         &mut state,
-        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Let me check.","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Let me check.","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#).unwrap(),
     )
     .unwrap();
 
@@ -548,34 +753,34 @@ fn s13_streaming_output_index_unique() {
     assert_eq!(indices[1], indices[0] + 1);
 }
 
-#[test]
-fn s13_streaming_output_index_with_reasoning() {
+#[tokio::test]
+async fn s13_streaming_output_index_with_reasoning() {
     let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    process_chunk(
+    process_chunk_value(
         &mut state,
-        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"reasoning_content":"Let me think"}}]}"#,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"reasoning_content":"Let me think"}}]}"#).unwrap(),
     );
-    process_chunk(
+    process_chunk_value(
         &mut state,
-        r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Answer","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#,
+        serde_json::from_str(r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Answer","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"search","arguments":"{}"}}]}}]}"#).unwrap(),
     );
 
-    // reasoning=0, message=1, tool_call=2
-    assert!(state.reasoning_item_added);
-    assert!(state.message_item_added);
+    // reasoning was closed at transition, message=1, tool_call=2
+    assert!(state.reasoning_content.is_empty()); // cleared when text started
+    assert!(!state.accumulated_text.is_empty());
     assert_eq!(state.msg_output_index, 1);
     assert_eq!(state.tool_calls[0].output_index, 2);
 }
 
 // ── Scenario 14: Streaming in_progress after created ─────────────────
 
-#[test]
-fn s14_streaming_in_progress_emitted() {
+#[tokio::test]
+async fn s14_streaming_in_progress_emitted() {
     let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
@@ -583,7 +788,7 @@ fn s14_streaming_in_progress_emitted() {
     );
 
     let events =
-        process_chunk(&mut state, r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Hello"}}]}"#).unwrap();
+        process_chunk_value(&mut state, serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"Hello"}}]}"#).unwrap()).unwrap();
 
     let types: Vec<String> = events
         .iter()
@@ -602,20 +807,20 @@ fn s14_streaming_in_progress_emitted() {
     assert!(created < in_progress);
 }
 
-#[test]
-fn s14_streaming_in_progress_only_once() {
+#[tokio::test]
+async fn s14_streaming_in_progress_only_once() {
     let mut state = StreamState::new(
         "resp_test".into(),
         "msg_test".into(),
         "deepseek-v4-pro".into(),
     );
 
-    process_chunk(
+    process_chunk_value(
         &mut state,
-        r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"A"}}]}"#,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"A"}}]}"#).unwrap(),
     );
     // second chunk — no duplicate in_progress
-    let events = process_chunk(&mut state, r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"B"}}]}"#).unwrap();
+    let events = process_chunk_value(&mut state, serde_json::from_str(r#"{"id":"c2","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"content":"B"}}]}"#).unwrap()).unwrap();
 
     let has_in_progress = events
         .iter()
@@ -625,8 +830,8 @@ fn s14_streaming_in_progress_only_once() {
 
 // ── Scenario 15: Cached tokens ───────────────────────────────────────
 
-#[test]
-fn s15_cached_tokens_openai_style() {
+#[tokio::test]
+async fn s15_cached_tokens_openai_style() {
     let chat: chat::Completion = serde_json::from_value(json!({
         "id": "chatcmpl-cache",
         "object": "chat.completion",
@@ -646,46 +851,17 @@ fn s15_cached_tokens_openai_style() {
     }))
     .unwrap();
 
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
+    let resp = chat_to_responses(chat, "gpt-5.5".into(), None);
     let j = serde_json::to_value(&resp).unwrap();
 
     assert_eq!(j["usage"]["input_tokens"], 100);
     assert_eq!(j["usage"]["input_tokens_details"]["cached_tokens"], 80);
 }
 
-#[test]
-fn s15_cached_tokens_deepseek_style() {
-    let chat: chat::Completion = serde_json::from_value(json!({
-        "id": "chatcmpl-ds",
-        "object": "chat.completion",
-        "created": 1715550000u64,
-        "model": "deepseek-v4-pro",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "response"},
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 30,
-            "total_tokens": 130,
-            "prompt_cache_hit_tokens": 60,
-            "prompt_cache_miss_tokens": 40
-        }
-    }))
-    .unwrap();
-
-    let resp = chat_to_responses(chat, "gpt-5.5".into());
-    let j = serde_json::to_value(&resp).unwrap();
-
-    // Falls back to hit+miss when prompt_tokens_details is absent
-    assert_eq!(j["usage"]["input_tokens_details"]["cached_tokens"], 100);
-}
-
 // ── Scenario 16: Instructions merged with input system message ───────
 
-#[test]
-fn s16_instructions_merge_with_system() {
+#[tokio::test]
+async fn s16_instructions_merge_with_system() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -696,22 +872,23 @@ fn s16_instructions_merge_with_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 2);
+    // instructions → system, input system → system, user → user = 3 messages
+    assert_eq!(msgs.len(), 3);
     assert_eq!(msgs[0]["role"], "system");
-    let sys = msgs[0]["content"].as_str().unwrap();
-    assert!(sys.starts_with("Top-level instructions."));
-    assert!(sys.contains("You are helpful."));
-    assert_eq!(msgs[1]["role"], "user");
+    assert_eq!(msgs[0]["content"], "Top-level instructions.");
+    assert_eq!(msgs[1]["role"], "system");
+    assert_eq!(msgs[1]["content"], "You are helpful.");
+    assert_eq!(msgs[2]["role"], "user");
 }
 
-// ── Scenario 17: Developer role maps to system ───────────────────────
+// ── Scenario 17: Developer role preserved ─────────────────────────────
 
-#[test]
-fn s17_developer_to_system() {
+#[tokio::test]
+async fn s17_developer_to_system() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -721,17 +898,18 @@ fn s17_developer_to_system() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
-    assert_eq!(j["messages"][0]["role"], "system");
+    // Developer message stays as developer (not converted to system)
+    assert_eq!(j["messages"][0]["role"], "developer");
     assert_eq!(j["messages"][0]["content"], "Dev rules");
 }
 
 // ── Scenario 18: Reasoning in input history ──────────────────────────
 
-#[test]
-fn s18_reasoning_item_in_input() {
+#[tokio::test]
+async fn s18_reasoning_item_in_input() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -742,7 +920,7 @@ fn s18_reasoning_item_in_input() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -756,8 +934,8 @@ fn s18_reasoning_item_in_input() {
 
 // ── Scenario 19: Multiple content blocks joined ──────────────────────
 
-#[test]
-fn s19_multiple_content_blocks_joined() {
+#[tokio::test]
+async fn s19_multiple_content_blocks_joined() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -769,7 +947,7 @@ fn s19_multiple_content_blocks_joined() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["content"], "Hello\nWorld");
@@ -777,8 +955,8 @@ fn s19_multiple_content_blocks_joined() {
 
 // ── Scenario 20: Empty instructions ignored ──────────────────────────
 
-#[test]
-fn s20_empty_instructions_ignored() {
+#[tokio::test]
+async fn s20_empty_instructions_ignored() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
@@ -786,7 +964,7 @@ fn s20_empty_instructions_ignored() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -795,8 +973,8 @@ fn s20_empty_instructions_ignored() {
 
 // ── Scenario 21: Image/file blocks silently dropped ──────────────────
 
-#[test]
-fn s21_image_file_blocks_dropped() {
+#[tokio::test]
+async fn s21_image_file_blocks_dropped() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [{"type": "message", "role": "user", "content": [
@@ -807,16 +985,27 @@ fn s21_image_file_blocks_dropped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
-    assert_eq!(j["messages"][0]["content"], "Describe:");
+    // Multimodal content is now passed through as Parts array
+    let content = j["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "Describe:");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "https://example.com/img.png"
+    );
+    assert_eq!(content[2]["type"], "file");
+    assert_eq!(content[2]["file"]["file_id"], "file-abc");
 }
 
 // ── Scenario 22: Unknown item/content silently skipped ───────────────
 
-#[test]
-fn s22_unknown_items_skipped() {
+#[tokio::test]
+async fn s22_unknown_items_skipped() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -827,7 +1016,7 @@ fn s22_unknown_items_skipped() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"].as_array().unwrap().len(), 1);
@@ -836,8 +1025,8 @@ fn s22_unknown_items_skipped() {
 
 // ── Scenario 23: String input with instructions ──────────────────────
 
-#[test]
-fn s23_string_input_with_instructions() {
+#[tokio::test]
+async fn s23_string_input_with_instructions() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "What is Rust?",
@@ -845,7 +1034,7 @@ fn s23_string_input_with_instructions() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();
@@ -858,8 +1047,8 @@ fn s23_string_input_with_instructions() {
 
 // ── Scenario 24: Array input with username ──── (tests position) ─────
 
-#[test]
-fn s24_function_call_output_array() {
+#[tokio::test]
+async fn s24_function_call_output_array() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [{"type": "function_call_output", "call_id": "call_1", "output": [
@@ -868,7 +1057,7 @@ fn s24_function_call_output_array() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["messages"][0]["role"], "tool");
@@ -878,8 +1067,8 @@ fn s24_function_call_output_array() {
 
 // ── Scenario 25: Stream options passthrough ──────────────────────────
 
-#[test]
-fn s25_stream_true() {
+#[tokio::test]
+async fn s25_stream_true() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": "Hi",
@@ -887,7 +1076,7 @@ fn s25_stream_true() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     assert_eq!(j["stream"], true);
@@ -895,8 +1084,8 @@ fn s25_stream_true() {
 
 // ── Scenario 26: Consecutive function calls merge ────────────────────
 
-#[test]
-fn s26_consecutive_function_calls_merge() {
+#[tokio::test]
+async fn s26_consecutive_function_calls_merge() {
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.5",
         "input": [
@@ -909,7 +1098,7 @@ fn s26_consecutive_function_calls_merge() {
     }))
     .unwrap();
 
-    let chat = responses_to_chat(req, &test_state());
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
     let j = serde_json::to_value(&chat).unwrap();
 
     let msgs = j["messages"].as_array().unwrap();

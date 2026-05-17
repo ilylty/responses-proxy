@@ -1,12 +1,11 @@
-use crate::convert::items_to_chat_messages;
-use crate::types::chat::{self, Completion};
-use crate::types::item::{Compaction, InputItem, OutputContentBlock, OutputItem, OutputMessage};
+use crate::types::chat::{self, Completion, MessageRequest};
+use crate::types::item::{Compaction, OutputContentBlock, OutputItem, OutputMessage};
 use crate::types::responses::{self, CompactedResponse, Error, Request};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
 /// POST /v1/responses/compact — summarize conversation history.
 ///
-/// Loads the full conversation chain from `state.history()` (keyed by
+/// Loads the full conversation chain from `state.store()` (keyed by
 /// `previous_response_id`), appends the summary prompt (from
 /// `state.prompts().get("summary")`) as a user message, sends everything to
 /// the upstream Chat API, and returns the model response wrapped in a
@@ -15,14 +14,16 @@ pub async fn compact(
     State(state): State<crate::app::State>,
     Json(req): Json<Request>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    // Load the full conversation chain from history
-    let history: Vec<InputItem> = match req.previous_response_id {
-        Some(ref pid) => state.history().get(pid).await.unwrap_or_default(),
+    // Walk the stored continuation chain so compaction sees the same replay
+    // history that previous_response_id continuation would use.
+    let mut messages: Vec<MessageRequest> = match req.previous_response_id {
+        Some(ref pid) => state
+            .store()
+            .get(pid)
+            .await
+            .unwrap_or(Vec::with_capacity(req.input.len())),
         None => vec![],
     };
-
-    // Build chat messages from the stored history
-    let mut messages = items_to_chat_messages(&history, &state);
 
     // Append the summary prompt as a user message
     let summary_prompt = state.prompts().get("summary");
@@ -35,12 +36,7 @@ pub async fn compact(
 
     // Look up the model provider
     let provider = state.config().models.get(&req.model).ok_or_else(|| {
-        let err = Error {
-            r#type: Some(Error::TYPE_INVALID_REQUEST.into()),
-            code: Error::CODE_SERVER_ERROR.into(),
-            message: format!("Unknown model: {}", req.model),
-            param: None,
-        };
+        let err = Error::invalid_request(format!("Unknown model: {}", req.model));
         (StatusCode::BAD_REQUEST, Json(err.to_http_json()))
     })?;
 
@@ -60,56 +56,33 @@ pub async fn compact(
         reasoning_effort: Some(crate::types::ReasoningEffort::None),
         ..Default::default()
     };
-
     // Send to upstream Chat API
     let url = format!("{}/chat/completions", provider.base_url);
-    let response = state
+    let request = state
         .http_client()
         .post(&url)
         .timeout(provider.timeout)
         .header("Authorization", format!("Bearer {}", provider.api_key))
         .header("Content-Type", "application/json")
-        .json(&upstream_req)
-        .send()
-        .await
-        .map_err(|e| {
-            let err = Error {
-                r#type: Some(Error::TYPE_SERVER_ERROR.into()),
-                code: Error::CODE_SERVER_ERROR.into(),
-                message: e.to_string(),
-                param: None,
-            };
-            (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
-        })?;
+        .json(&upstream_req);
+    let response = request.send().await.map_err(|e| {
+        let err = Error::server_error(e.to_string());
+        (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
+    })?;
 
     let status = response.status();
     let body_text = response.text().await.map_err(|e| {
-        let err = Error {
-            r#type: Some(Error::TYPE_SERVER_ERROR.into()),
-            code: Error::CODE_SERVER_ERROR.into(),
-            message: e.to_string(),
-            param: None,
-        };
+        let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
 
     if !status.is_success() {
-        let err = Error {
-            r#type: Some(Error::TYPE_SERVER_ERROR.into()),
-            code: Error::CODE_SERVER_ERROR.into(),
-            message: format!("Upstream returned {status}: {body_text}"),
-            param: None,
-        };
+        let err = Error::server_error(format!("Upstream returned {status}: {body_text}"));
         return Err((StatusCode::BAD_GATEWAY, Json(err.to_http_json())));
     }
 
     let chat_resp: Completion = serde_json::from_str(&body_text).map_err(|e| {
-        let err = Error {
-            r#type: Some(Error::TYPE_SERVER_ERROR.into()),
-            code: Error::CODE_SERVER_ERROR.into(),
-            message: e.to_string(),
-            param: None,
-        };
+        let err = Error::server_error(e.to_string());
         (StatusCode::BAD_GATEWAY, Json(err.to_http_json()))
     })?;
 

@@ -1,5 +1,5 @@
-//! Typed API schema — complete struct definitions aligned with the
-//! [openai-go](https://github.com/openai/openai-go) SDK.
+//! Typed API schema — request and response struct definitions modeled from the
+//! official OpenAI Responses API and Chat Completions API references.
 //!
 //! Each sub-module corresponds to a logical domain within the OpenAI API.
 //! Struct names omit the domain prefix because the module path already

@@ -5,11 +5,9 @@
 //! - [`cancel`] — `response.cancel`
 //! - [`ping`]   — `ping` / `pong` keepalive
 
-mod cancel;
 mod create;
 mod ping;
 
-use crate::types::item::InputItem;
 use crate::types::websocket::ClientEvent;
 use axum::extract::{
     State,
@@ -37,9 +35,6 @@ pub(super) async fn send(socket: &mut WebSocket, text: &str) {
 async fn run(mut socket: WebSocket, state: crate::app::State) {
     tracing::info!("WebSocket connection established");
 
-    let mut history: Vec<InputItem> = Vec::new();
-    let mut last_rid: Option<String> = None;
-
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
             WsMsg::Text(t) => t.to_string(),
@@ -63,12 +58,11 @@ async fn run(mut socket: WebSocket, state: crate::app::State) {
         match event {
             ClientEvent::ResponseCreate(req) => {
                 tracing::info!("WS received event: response.create");
-                create::handle(&state, &mut socket, req, &mut history, &mut last_rid).await;
+                create::handle(&state, &mut socket, req).await;
             }
 
             ClientEvent::ResponseCancel => {
                 tracing::info!("WS received event: response.cancel");
-                cancel::handle(&state, &mut history, &mut last_rid).await;
             }
 
             ClientEvent::Ping => {
@@ -77,9 +71,5 @@ async fn run(mut socket: WebSocket, state: crate::app::State) {
         }
     }
 
-    // Cleanup on disconnect
-    if let Some(rid) = last_rid.as_deref() {
-        state.history().remove(rid).await;
-    }
     tracing::info!("WebSocket connection closed");
 }
