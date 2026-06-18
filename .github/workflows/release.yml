@@ -35,9 +35,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: responses-proxy-linux-amd64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            name: responses-proxy-linux-arm64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            name: responses-proxy-linux-musl-arm64
           - os: macos-latest
             target: aarch64-apple-darwin
             name: responses-proxy-darwin-arm64
@@ -59,8 +59,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Setup QEMU
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
+
       - name: Build
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
